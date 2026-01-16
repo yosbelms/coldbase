@@ -60,7 +60,7 @@ await users.put('u1', null)
 
 ## Logging
 
-Mini-DB uses [LogTape](https://github.com/doodadjs/logtape) for logging. You can configure it to see internal operations:
+Coldbase uses [LogTape](https://github.com/doodadjs/logtape) for logging. You can configure it to see internal operations:
 
 ```typescript
 import { configure, getConsoleSink } from '@logtape/logtape'
@@ -76,7 +76,7 @@ await configure({
 
 ## Serverless Usage
 
-Mini-DB is designed for serverless environments where functions may cold start frequently. It offers probabilistic auto-maintenance that distributes load across invocations:
+Coldbase is designed for serverless environments where functions may cold start frequently. It offers probabilistic auto-maintenance that distributes load across invocations:
 
 ```typescript
 import { Db, S3Driver, SERVERLESS_AUTO_COMPACT, SERVERLESS_AUTO_VACUUM } from 'coldbase'
