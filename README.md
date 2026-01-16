@@ -46,9 +46,7 @@ interface User {
 const users = db.collection<User>('users')
 
 // Write
-await users.put(
-  { id: 'u1', data: { id: 'u1', name: 'Alice', email: 'alice@example.com', role: 'admin' } }
-)
+await users.put('u1', { name: 'Alice', email: 'alice@example.com', role: 'admin' })
 
 // Read single
 const user = await users.get('u1')
@@ -57,7 +55,7 @@ const user = await users.get('u1')
 const admins = await users.find({ where: { role: 'admin' } })
 
 // Delete
-await users.put({ id: 'u1', data: null })
+await users.put('u1', null)
 ```
 
 ## Logging
@@ -109,7 +107,7 @@ export async function handler(event) {
   const user = await users.get(event.userId)
 
   // Writes may trigger maintenance probabilistically (non-blocking)
-  await users.put({ id: event.userId, data: { ...user, lastSeen: Date.now() } })
+  await users.put(event.userId, { ...user, lastSeen: Date.now() })
 
   return { user }
 }
@@ -209,17 +207,17 @@ db.vacuum(name: string): Promise<VacuumResult>
 
 **Writing:**
 ```typescript
-// Single or multiple items
-await collection.put(
-  { id: 'id1', data: { id: 'id1', ...fields } },
-  { id: 'id2', data: null }  // Delete
-)
+// Single item
+await collection.put('id1', { ...fields })
+
+// Delete
+await collection.put('id1', null)
 
 // Batch writes (coalesces into single mutation file for better performance)
 await collection.batch(tx => {
-  tx.put({ id: 'id1', data: { id: 'id1', name: 'Alice' } })
-  tx.put({ id: 'id2', data: { id: 'id2', name: 'Bob' } })
-  tx.put({ id: 'id3', data: null })  // Delete
+  tx.put('id1', { name: 'Alice' })
+  tx.put('id2', { name: 'Bob' })
+  tx.put('id3', null)  // Delete
 })
 ```
 

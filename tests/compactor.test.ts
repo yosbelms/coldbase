@@ -27,8 +27,8 @@ describe('CollectionCompactor', () => {
 
   test('compact merges mutations into main file', async () => {
     const collection = db.collection<{ id: string; val: number }>(collectionName)
-    await collection.put({ id: '1', data: { id: '1', val: 1 } })
-    await collection.put({ id: '2', data: { id: '2', val: 2 } })
+    await collection.put('1', { id: '1', val: 1 })
+    await collection.put('2', { id: '2', val: 2 })
 
     const result = await compactor.compact(collectionName)
 

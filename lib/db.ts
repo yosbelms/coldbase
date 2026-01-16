@@ -23,7 +23,7 @@ interface IndexEntry {
 
 /** Transaction interface for batching multiple writes */
 export interface BatchTransaction<T extends { id: string }> {
-  put(item: { id: string; data: T | null }): void
+  put(id: string, data: T | null): void
 }
 
 export { DbOptions }
@@ -149,27 +149,31 @@ export class Collection<T extends { id: string }> {
    *
    * @example
    * await collection.batch(async (tx) => {
-   *   tx.put({ id: '1', data: { id: '1', name: 'Alice' } })
-   *   tx.put({ id: '2', data: { id: '2', name: 'Bob' } })
+   *   tx.put('1', { id: '1', name: 'Alice' })
+   *   tx.put('2', { id: '2', name: 'Bob' })
    * })
    */
   async batch(fn: (tx: BatchTransaction<T>) => void | Promise<void>): Promise<void> {
     const items: { id: string; data: T | null }[] = []
 
     const tx: BatchTransaction<T> = {
-      put: (item: { id: string; data: T | null }) => {
-        items.push(item)
+      put: (id: string, data: T | null) => {
+        items.push({ id, data })
       }
     }
 
     await fn(tx)
 
     if (items.length > 0) {
-      await this.put(...items)
+      await this._putItems(items)
     }
   }
 
-  async put(...items: { id: string; data: T | null }[]): Promise<void> {
+  async put(id: string, data: T | null): Promise<void> {
+    return this._putItems([{ id, data }])
+  }
+
+  private async _putItems(items: { id: string; data: T | null }[]): Promise<void> {
     this.logger.debug('Writing {count} items to collection {name}', { count: items.length, name: this.name })
     const now = Date.now()
     const payload: MutationBatch = items.map(({ id, data }) => [id, data, now])
@@ -543,7 +547,7 @@ export class Collection<T extends { id: string }> {
     }
 
     if (toDelete.length) {
-      await this.put(...toDelete)
+      await this._putItems(toDelete)
     }
     return toDelete.length
   }

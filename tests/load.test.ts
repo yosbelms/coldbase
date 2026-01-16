@@ -45,10 +45,7 @@ describe('Load Tests', () => {
 
       const start = performance.now()
       for (let i = 0; i < count; i++) {
-        await collection.put({
-          id: `record-${i}`,
-          data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-        })
+        await collection.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
       }
       const duration = performance.now() - start
 
@@ -66,10 +63,7 @@ describe('Load Tests', () => {
         await collection.batch(tx => {
           for (let i = 0; i < batchSize; i++) {
             const idx = batch * batchSize + i
-            tx.put({
-              id: `record-${idx}`,
-              data: { id: `record-${idx}`, name: `Name ${idx}`, value: idx, timestamp: Date.now() }
-            })
+            tx.put(`record-${idx}`, { id: `record-${idx}`, name: `Name ${idx}`, value: idx, timestamp: Date.now() })
           }
         })
       }
@@ -86,10 +80,7 @@ describe('Load Tests', () => {
       const start = performance.now()
       await collection.batch(tx => {
         for (let i = 0; i < count; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       const duration = performance.now() - start
@@ -108,10 +99,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -134,10 +122,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -160,10 +145,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -185,10 +167,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -210,10 +189,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -232,10 +208,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -254,10 +227,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < recordCount; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -277,10 +247,7 @@ describe('Load Tests', () => {
 
       // Create 100 mutation files
       for (let i = 0; i < 100; i++) {
-        await collection.put({
-          id: `record-${i}`,
-          data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-        })
+        await collection.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
       }
 
       const mutationCount = await collection.countMutationFiles()
@@ -301,10 +268,7 @@ describe('Load Tests', () => {
       // Create records
       await collection.batch(tx => {
         for (let i = 0; i < 500; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
 
@@ -328,10 +292,7 @@ describe('Load Tests', () => {
       for (let round = 0; round < 5; round++) {
         await collection.batch(tx => {
           for (let i = 0; i < 100; i++) {
-            tx.put({
-              id: `record-${i}`,
-              data: { id: `record-${i}`, name: `Name ${i} v${round}`, value: i + round, timestamp: Date.now() }
-            })
+            tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i} v${round}`, value: i + round, timestamp: Date.now() })
           }
         })
       }
@@ -352,17 +313,14 @@ describe('Load Tests', () => {
       // Create records
       await collection.batch(tx => {
         for (let i = 0; i < 200; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
 
       // Delete half
       await collection.batch(tx => {
         for (let i = 0; i < 100; i++) {
-          tx.put({ id: `record-${i}`, data: null })
+          tx.put(`record-${i}`, null)
         }
       })
 
@@ -385,10 +343,7 @@ describe('Load Tests', () => {
       const start = performance.now()
       await Promise.all(
         Array.from({ length: parallelWrites }, (_, i) =>
-          collection.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          collection.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         )
       )
       const duration = performance.now() - start
@@ -403,10 +358,7 @@ describe('Load Tests', () => {
       // Setup data
       await collection.batch(tx => {
         for (let i = 0; i < 100; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -431,10 +383,7 @@ describe('Load Tests', () => {
       // Pre-populate
       await collection.batch(tx => {
         for (let i = 0; i < 50; i++) {
-          tx.put({
-            id: `record-${i}`,
-            data: { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() }
-          })
+          tx.put(`record-${i}`, { id: `record-${i}`, name: `Name ${i}`, value: i, timestamp: Date.now() })
         }
       })
       await collection.compact()
@@ -446,10 +395,7 @@ describe('Load Tests', () => {
         Array.from({ length: operations }, (_, i) => {
           if (i % 3 === 0) {
             // Write
-            return collection.put({
-              id: `new-record-${i}`,
-              data: { id: `new-record-${i}`, name: `New ${i}`, value: i, timestamp: Date.now() }
-            })
+            return collection.put(`new-record-${i}`, { id: `new-record-${i}`, name: `New ${i}`, value: i, timestamp: Date.now() })
           } else {
             // Read
             return collection.get(`record-${i % 50}`)
@@ -468,10 +414,7 @@ describe('Load Tests', () => {
       const largeData = 'x'.repeat(100000) // 100KB payload
 
       const start = performance.now()
-      await collection.put({
-        id: 'large-record',
-        data: { id: 'large-record', name: 'Large', value: 1, timestamp: Date.now(), data: largeData }
-      })
+      await collection.put('large-record', { id: 'large-record', name: 'Large', value: 1, timestamp: Date.now(), data: largeData })
       const writeTime = performance.now() - start
 
       await collection.compact()
@@ -494,10 +437,7 @@ describe('Load Tests', () => {
         await collection.batch(tx => {
           for (let i = 0; i < 200; i++) {
             const idx = batch * 200 + i
-            tx.put({
-              id: `r-${idx}`,
-              data: { id: `r-${idx}`, name: `N${idx}`, value: idx, timestamp: Date.now() }
-            })
+            tx.put(`r-${idx}`, { id: `r-${idx}`, name: `N${idx}`, value: idx, timestamp: Date.now() })
           }
         })
       }

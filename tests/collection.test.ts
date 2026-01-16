@@ -24,8 +24,8 @@ describe('Db', () => {
     const users = db.collection<{ id: string; name: string }>('users')
     const posts = db.collection<{ id: string; title: string }>('posts')
 
-    await users.put({ id: 'u1', data: { id: 'u1', name: 'Alice' } })
-    await posts.put({ id: 'p1', data: { id: 'p1', title: 'Hello' } })
+    await users.put('u1', { id: 'u1', name: 'Alice' })
+    await posts.put('p1', { id: 'p1', title: 'Hello' })
 
     const userMutations = await driver.list('users.mutation.')
     const postMutations = await driver.list('posts.mutation.')
@@ -43,7 +43,7 @@ describe('Db', () => {
   test('compact and vacuum delegate to compactor', async () => {
     const db = new Db(driver, { autoCompact: false })
     const col = db.collection<{ id: string; val: number }>('test')
-    await col.put({ id: '1', data: { id: '1', val: 1 } })
+    await col.put('1', { id: '1', val: 1 })
 
     await db.compact('test')
     const mutations = await driver.list('test.mutation.')
@@ -60,7 +60,7 @@ describe('Db', () => {
     })
 
     const col = db.collection<{ id: string }>('hooks-test')
-    await col.put({ id: '1', data: { id: '1' } })
+    await col.put('1', { id: '1' })
     expect(onWrite).toHaveBeenCalledWith('hooks-test', 1)
 
     await db.compact('hooks-test')
@@ -87,7 +87,7 @@ describe('Collection', () => {
   })
 
   test('put writes mutation file', async () => {
-    await collection.put({ id: '1', data: { id: '1', name: 'test' } })
+    await collection.put('1', { id: '1', name: 'test' })
 
     const list = await driver.list(`${collectionName}.mutation.`)
     expect(list.keys.length).toBe(1)
@@ -104,7 +104,7 @@ describe('Collection', () => {
   })
 
   test('get returns single record', async () => {
-    await collection.put({ id: '1', data: { id: '1', name: 'test' } })
+    await collection.put('1', { id: '1', name: 'test' })
 
     const item = await collection.get('1')
     expect(item).toEqual({ id: '1', name: 'test' })
@@ -114,11 +114,11 @@ describe('Collection', () => {
   })
 
   test('getMany returns multiple records', async () => {
-    await collection.put(
-      { id: '1', data: { id: '1', name: 'one' } },
-      { id: '2', data: { id: '2', name: 'two' } },
-      { id: '3', data: { id: '3', name: 'three' } }
-    )
+    await collection.batch(tx => {
+      tx.put('1', { id: '1', name: 'one' })
+      tx.put('2', { id: '2', name: 'two' })
+      tx.put('3', { id: '3', name: 'three' })
+    })
 
     const items = await collection.getMany(['1', '3', 'nonexistent'])
     expect(items.size).toBe(2)
@@ -127,11 +127,11 @@ describe('Collection', () => {
   })
 
   test('find with where clause', async () => {
-    await collection.put(
-      { id: '1', data: { id: '1', name: 'Alice', age: 30 } },
-      { id: '2', data: { id: '2', name: 'Bob', age: 25 } },
-      { id: '3', data: { id: '3', name: 'Alice', age: 35 } }
-    )
+    await collection.batch(tx => {
+      tx.put('1', { id: '1', name: 'Alice', age: 30 })
+      tx.put('2', { id: '2', name: 'Bob', age: 25 })
+      tx.put('3', { id: '3', name: 'Alice', age: 35 })
+    })
 
     const alices = await collection.find({ where: { name: 'Alice' } })
     expect(alices.length).toBe(2)
@@ -141,25 +141,25 @@ describe('Collection', () => {
   })
 
   test('find with function predicate', async () => {
-    await collection.put(
-      { id: '1', data: { id: '1', age: 30 } },
-      { id: '2', data: { id: '2', age: 25 } },
-      { id: '3', data: { id: '3', age: 35 } }
-    )
+    await collection.batch(tx => {
+      tx.put('1', { id: '1', age: 30 })
+      tx.put('2', { id: '2', age: 25 })
+      tx.put('3', { id: '3', age: 35 })
+    })
 
     const over30 = await collection.find({ where: (item: any) => item.age >= 30 })
     expect(over30.length).toBe(2)
   })
 
   test('count returns number of records', async () => {
-    await collection.put(
-      { id: '1', data: { id: '1' } },
-      { id: '2', data: { id: '2' } }
-    )
+    await collection.batch(tx => {
+      tx.put('1', { id: '1' })
+      tx.put('2', { id: '2' })
+    })
 
     expect(await collection.count()).toBe(2)
 
-    await collection.put({ id: '1', data: null })
+    await collection.put('1', null)
     expect(await collection.count()).toBe(1)
   })
 
@@ -183,10 +183,10 @@ describe('Collection', () => {
   })
 
   test('read yields from pending mutations', async () => {
-    await collection.put(
-      { id: '1', data: { id: '1', name: 'one' } },
-      { id: '2', data: { id: '2', name: 'two' } }
-    )
+    await collection.batch(tx => {
+      tx.put('1', { id: '1', name: 'one' })
+      tx.put('2', { id: '2', name: 'two' })
+    })
 
     const items = []
     for await (const item of collection.read()) {
@@ -200,7 +200,7 @@ describe('Collection', () => {
   })
 
   test('read yields deletions (null data)', async () => {
-    await collection.put({ id: '1', data: null })
+    await collection.put('1', null)
 
     const items = []
     for await (const item of collection.read()) {
@@ -234,10 +234,10 @@ describe('TTL', () => {
     const past = Date.now() - 1000
     const future = Date.now() + 100000
 
-    await col.put(
-      { id: '1', data: { id: '1', expiresAt: past } },
-      { id: '2', data: { id: '2', expiresAt: future } }
-    )
+    await col.batch(tx => {
+      tx.put('1', { id: '1', expiresAt: past })
+      tx.put('2', { id: '2', expiresAt: future })
+    })
 
     const item1 = await col.get('1')
     const item2 = await col.get('2')
@@ -252,10 +252,10 @@ describe('TTL', () => {
 
     const past = Date.now() - 1000
 
-    await col.put(
-      { id: '1', data: { id: '1', expiresAt: past } },
-      { id: '2', data: { id: '2', expiresAt: past } }
-    )
+    await col.batch(tx => {
+      tx.put('1', { id: '1', expiresAt: past })
+      tx.put('2', { id: '2', expiresAt: past })
+    })
 
     const deleted = await col.deleteExpired()
     expect(deleted).toBe(2)
@@ -282,7 +282,7 @@ describe('Size limits', () => {
     const largeData = 'x'.repeat(200)
 
     await expect(
-      col.put({ id: '1', data: { id: '1', data: largeData } })
+      col.put('1', { id: '1', data: largeData })
     ).rejects.toThrow('Payload size')
   })
 })
