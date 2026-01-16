@@ -1,0 +1,40 @@
+{
+  "name": "coldbase",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "jest",
+    "build": "npx tsc -d",
+    "clean": "find . -type f \\( -name \"*.js\" -o -name \"*.js.map\" -o -name \"*.d.ts\" -o -name \"*.d.ts.map\" \\) | grep -v \"./node_modules\" | xargs rm",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "keywords": [
+    "database",
+    "storage",
+    "s3",
+    "azure",
+    "blob",
+    "cold-storage",
+    "cloud"
+  ],
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.0.3",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.8",
+    "@logtape/logtape": "^1.3.5",
+    "hono": "^4.11.3"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": "^3.966.0",
+    "@azure/storage-blob": "^12.29.1"
+  }
+}
