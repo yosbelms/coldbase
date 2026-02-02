@@ -24,8 +24,8 @@ describe('Db', () => {
     const users = db.collection<{ id: string; name: string }>('users')
     const posts = db.collection<{ id: string; title: string }>('posts')
 
-    await users.put('u1', { id: 'u1', name: 'Alice' })
-    await posts.put('p1', { id: 'p1', title: 'Hello' })
+    await users.put({ id: 'u1', name: 'Alice' })
+    await posts.put({ id: 'p1', title: 'Hello' })
 
     const userMutations = await driver.list('users.mutation.')
     const postMutations = await driver.list('posts.mutation.')
@@ -43,7 +43,7 @@ describe('Db', () => {
   test('compact and vacuum delegate to compactor', async () => {
     const db = new Db(driver, { autoCompact: false })
     const col = db.collection<{ id: string; val: number }>('test')
-    await col.put('1', { id: '1', val: 1 })
+    await col.put({ id: '1', val: 1 })
 
     await db.compact('test')
     const mutations = await driver.list('test.mutation.')
@@ -60,7 +60,7 @@ describe('Db', () => {
     })
 
     const col = db.collection<{ id: string }>('hooks-test')
-    await col.put('1', { id: '1' })
+    await col.put({ id: '1' })
     expect(onWrite).toHaveBeenCalledWith('hooks-test', 1)
 
     await db.compact('hooks-test')
@@ -87,7 +87,7 @@ describe('Collection', () => {
   })
 
   test('put writes mutation file', async () => {
-    await collection.put('1', { id: '1', name: 'test' })
+    await collection.put({ id: '1', name: 'test' })
 
     const list = await driver.list(`${collectionName}.mutation.`)
     expect(list.keys.length).toBe(1)
@@ -104,7 +104,7 @@ describe('Collection', () => {
   })
 
   test('get returns single record', async () => {
-    await collection.put('1', { id: '1', name: 'test' })
+    await collection.put({ id: '1', name: 'test' })
 
     const item = await collection.get('1')
     expect(item).toEqual({ id: '1', name: 'test' })
@@ -115,9 +115,9 @@ describe('Collection', () => {
 
   test('getMany returns multiple records', async () => {
     await collection.batch(tx => {
-      tx.put('1', { id: '1', name: 'one' })
-      tx.put('2', { id: '2', name: 'two' })
-      tx.put('3', { id: '3', name: 'three' })
+      tx.put({ id: '1', name: 'one' })
+      tx.put({ id: '2', name: 'two' })
+      tx.put({ id: '3', name: 'three' })
     })
 
     const items = await collection.getMany(['1', '3', 'nonexistent'])
@@ -128,9 +128,9 @@ describe('Collection', () => {
 
   test('find with where clause', async () => {
     await collection.batch(tx => {
-      tx.put('1', { id: '1', name: 'Alice', age: 30 })
-      tx.put('2', { id: '2', name: 'Bob', age: 25 })
-      tx.put('3', { id: '3', name: 'Alice', age: 35 })
+      tx.put({ id: '1', name: 'Alice', age: 30 })
+      tx.put({ id: '2', name: 'Bob', age: 25 })
+      tx.put({ id: '3', name: 'Alice', age: 35 })
     })
 
     const alices = await collection.find({ where: { name: 'Alice' } })
@@ -142,9 +142,9 @@ describe('Collection', () => {
 
   test('find with function predicate', async () => {
     await collection.batch(tx => {
-      tx.put('1', { id: '1', age: 30 })
-      tx.put('2', { id: '2', age: 25 })
-      tx.put('3', { id: '3', age: 35 })
+      tx.put({ id: '1', age: 30 })
+      tx.put({ id: '2', age: 25 })
+      tx.put({ id: '3', age: 35 })
     })
 
     const over30 = await collection.find({ where: (item: any) => item.age >= 30 })
@@ -153,13 +153,13 @@ describe('Collection', () => {
 
   test('count returns number of records', async () => {
     await collection.batch(tx => {
-      tx.put('1', { id: '1' })
-      tx.put('2', { id: '2' })
+      tx.put({ id: '1' })
+      tx.put({ id: '2' })
     })
 
     expect(await collection.count()).toBe(2)
 
-    await collection.put('1', null)
+    await collection.delete('1')
     expect(await collection.count()).toBe(1)
   })
 
@@ -184,8 +184,8 @@ describe('Collection', () => {
 
   test('read yields from pending mutations', async () => {
     await collection.batch(tx => {
-      tx.put('1', { id: '1', name: 'one' })
-      tx.put('2', { id: '2', name: 'two' })
+      tx.put({ id: '1', name: 'one' })
+      tx.put({ id: '2', name: 'two' })
     })
 
     const items = []
@@ -200,7 +200,7 @@ describe('Collection', () => {
   })
 
   test('read yields deletions (null data)', async () => {
-    await collection.put('1', null)
+    await collection.delete('1')
 
     const items = []
     for await (const item of collection.read()) {
@@ -228,15 +228,14 @@ describe('TTL', () => {
   })
 
   test('expired records are not returned', async () => {
-    const col = db.collection<{ id: string; expiresAt: number }>('ttl-test')
-    col.defineTTL('expiresAt')
+    const col = db.collection<{ id: string; expiresAt: number }>('ttl-test', { ttlField: 'expiresAt' })
 
     const past = Date.now() - 1000
     const future = Date.now() + 100000
 
     await col.batch(tx => {
-      tx.put('1', { id: '1', expiresAt: past })
-      tx.put('2', { id: '2', expiresAt: future })
+      tx.put({ id: '1', expiresAt: past })
+      tx.put({ id: '2', expiresAt: future })
     })
 
     const item1 = await col.get('1')
@@ -247,14 +246,13 @@ describe('TTL', () => {
   })
 
   test('deleteExpired removes expired records', async () => {
-    const col = db.collection<{ id: string; expiresAt: number }>('ttl-delete-test')
-    col.defineTTL('expiresAt')
+    const col = db.collection<{ id: string; expiresAt: number }>('ttl-delete-test', { ttlField: 'expiresAt' })
 
     const past = Date.now() - 1000
 
     await col.batch(tx => {
-      tx.put('1', { id: '1', expiresAt: past })
-      tx.put('2', { id: '2', expiresAt: past })
+      tx.put({ id: '1', expiresAt: past })
+      tx.put({ id: '2', expiresAt: past })
     })
 
     const deleted = await col.deleteExpired()
@@ -282,7 +280,7 @@ describe('Size limits', () => {
     const largeData = 'x'.repeat(200)
 
     await expect(
-      col.put('1', { id: '1', data: largeData })
+      col.put({ id: '1', data: largeData })
     ).rejects.toThrow('Payload size')
   })
 })

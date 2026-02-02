@@ -36,13 +36,6 @@ export class LockAcquisitionError extends LockError {
   }
 }
 
-export class NotFoundError extends MiniDbError {
-  constructor(key: string) {
-    super(`Key not found: ${key}`)
-    this.name = 'NotFoundError'
-  }
-}
-
 export class ValidationError extends MiniDbError {
   constructor(message: string) {
     super(message)
@@ -61,5 +54,19 @@ export class CorruptionError extends MiniDbError {
   constructor(message: string, public readonly key?: string) {
     super(message)
     this.name = 'CorruptionError'
+  }
+}
+
+export class VectorDimensionError extends ValidationError {
+  constructor(expected: number, actual: number) {
+    super(`Vector dimension mismatch: expected ${expected}, got ${actual}`)
+    this.name = 'VectorDimensionError'
+  }
+}
+
+export class InvalidVectorError extends ValidationError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvalidVectorError'
   }
 }

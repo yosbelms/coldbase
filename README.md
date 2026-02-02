@@ -7,6 +7,7 @@ A lightweight, serverless-first write-ahead log (WAL) database for cloud storage
 - **Serverless-First**: Stateless operations, no in-memory state between invocations
 - **Auto-Maintenance**: Probabilistic compaction and vacuum triggers for serverless
 - **Multi-Collection Support**: Single `Db` instance manages multiple collections
+- **Vector Collections**: Store and search vector embeddings with cosine, euclidean, or dot product similarity
 - **Query API**: `find()` with filtering, pagination, and function predicates
 - **TTL Support**: Auto-expire records based on a timestamp field
 - **Batch Operations**: `getMany()` for efficient multi-key lookups, `batch()` for coalescing writes
@@ -46,7 +47,7 @@ interface User {
 const users = db.collection<User>('users')
 
 // Write
-await users.put('u1', { name: 'Alice', email: 'alice@example.com', role: 'admin' })
+await users.put({ id: 'u1', name: 'Alice', email: 'alice@example.com', role: 'admin' })
 
 // Read single
 const user = await users.get('u1')
@@ -55,7 +56,7 @@ const user = await users.get('u1')
 const admins = await users.find({ where: { role: 'admin' } })
 
 // Delete
-await users.put('u1', null)
+await users.delete('u1')
 ```
 
 ## Logging
@@ -107,7 +108,7 @@ export async function handler(event) {
   const user = await users.get(event.userId)
 
   // Writes may trigger maintenance probabilistically (non-blocking)
-  await users.put(event.userId, { ...user, lastSeen: Date.now() })
+  await users.put({ ...user, lastSeen: Date.now() })
 
   return { user }
 }
@@ -198,7 +199,8 @@ import { SERVERLESS_AUTO_COMPACT, SERVERLESS_AUTO_VACUUM } from 'coldbase'
 
 **Methods:**
 ```typescript
-db.collection<T>(name: string): Collection<T>
+db.collection<T>(name: string, options?: CollectionOptions): Collection<T>
+db.vectorCollection<T>(name: string, options: VectorCollectionOptions): VectorCollection<T>
 db.compact(name: string): Promise<CompactResult>
 db.vacuum(name: string): Promise<VacuumResult>
 ```
@@ -208,16 +210,16 @@ db.vacuum(name: string): Promise<VacuumResult>
 **Writing:**
 ```typescript
 // Single item
-await collection.put('id1', { ...fields })
+await collection.put({ id: 'id1', ...fields })
 
 // Delete
-await collection.put('id1', null)
+await collection.delete('id1')
 
 // Batch writes (coalesces into single mutation file for better performance)
 await collection.batch(tx => {
-  tx.put('id1', { name: 'Alice' })
-  tx.put('id2', { name: 'Bob' })
-  tx.put('id3', null)  // Delete
+  tx.put({ id: 'id1', name: 'Alice' })
+  tx.put({ id: 'id2', name: 'Bob' })
+  tx.delete('id3')
 })
 ```
 
@@ -260,8 +262,7 @@ interface Session {
   expiresAt: number  // Unix timestamp ms
 }
 
-const sessions = db.collection<Session>('sessions')
-sessions.defineTTL('expiresAt')
+const sessions = db.collection<Session>('sessions', { ttlField: 'expiresAt' })
 
 // Expired records are automatically filtered from reads
 // Clean up expired records (call from scheduled function):
@@ -284,6 +285,105 @@ users.startMaintenance({
 users.stopMaintenance()
 ```
 The maintenance task automatically handles `LockActiveError` by silently skipping the operation if another process is already performing maintenance.
+
+### `VectorCollection<T>`
+
+Vector collections store documents with vector embeddings and support similarity search. Uses brute-force (exact) search, suitable for small to medium datasets (10k-100k vectors).
+
+**Creating a Vector Collection:**
+```typescript
+interface Embedding {
+  id: string
+  vector: number[]
+  text: string
+  category?: string
+}
+
+const embeddings = db.vectorCollection<Embedding>('embeddings', {
+  dimension: 384,           // Required: vector dimension
+  metric: 'cosine',         // 'cosine' | 'euclidean' | 'dotProduct' (default: 'cosine')
+  normalize: true           // Auto-normalize on insert (default: true for cosine)
+})
+```
+
+**Writing:**
+```typescript
+// Single item
+await embeddings.put({
+  id: 'doc1',
+  vector: [0.1, 0.2, ...],  // Must match dimension
+  text: 'Hello world'
+})
+
+// Batch writes
+await embeddings.batch(tx => {
+  tx.put({ id: 'doc1', vector: [...], text: 'First' })
+  tx.put({ id: 'doc2', vector: [...], text: 'Second' })
+})
+
+// Delete
+await embeddings.delete('doc1')
+```
+
+**Similarity Search:**
+```typescript
+const results = await embeddings.search([0.1, 0.2, ...], {
+  limit: 10,                           // Max results (default: 10)
+  threshold: 0.8,                      // Min similarity (cosine/dot) or max distance (euclidean)
+  filter: { category: 'news' },        // Metadata filter (object or function)
+  includeVector: false                 // Include vectors in results (default: false)
+})
+
+// Results sorted by similarity (descending for cosine/dot, ascending for euclidean)
+for (const { id, score, data } of results) {
+  console.log(`${id}: ${score} - ${data.text}`)
+}
+
+// Filter with function
+const results = await embeddings.search(queryVector, {
+  filter: (item) => item.category === 'news' && item.text.length > 100
+})
+```
+
+**Reading:**
+```typescript
+// Single record
+const doc = await embeddings.get('doc1')
+
+// Multiple records
+const docs = await embeddings.getMany(['doc1', 'doc2'])
+
+// Query with metadata filter (no vector search)
+const news = await embeddings.find({
+  where: { category: 'news' },
+  limit: 100,
+  includeVector: false  // Exclude vectors from results (default: false)
+})
+
+// Count and streaming
+const count = await embeddings.count()
+for await (const { id, data } of embeddings.read()) {
+  console.log(id, data)
+}
+```
+
+**TTL and Maintenance:**
+```typescript
+// TTL support (pass ttlField in vectorCollection options)
+await embeddings.deleteExpired()
+
+// Compaction and vacuum (same as Collection)
+await embeddings.compact()
+await embeddings.vacuum()
+```
+
+**Similarity Metrics:**
+
+| Metric | Range | Best For | Sorting |
+|--------|-------|----------|---------|
+| `cosine` | -1 to 1 | Normalized embeddings (OpenAI, Cohere) | Descending |
+| `euclidean` | 0 to ∞ | Raw feature vectors | Ascending |
+| `dotProduct` | -∞ to ∞ | When magnitude matters | Descending |
 
 ## Storage Drivers
 
@@ -312,7 +412,9 @@ import {
   MiniDbError,
   PreconditionFailedError,
   LockActiveError,
-  SizeLimitError
+  SizeLimitError,
+  VectorDimensionError,
+  InvalidVectorError
 } from 'coldbase'
 
 try {
@@ -322,6 +424,17 @@ try {
     console.log('Another process is compacting')
   } else if (e instanceof SizeLimitError) {
     console.log('Mutation too large')
+  }
+}
+
+// Vector-specific errors
+try {
+  await embeddings.put({ id: 'doc1', vector: [1, 2] })  // Wrong dimension
+} catch (e) {
+  if (e instanceof VectorDimensionError) {
+    console.log('Vector dimension mismatch')
+  } else if (e instanceof InvalidVectorError) {
+    console.log('Invalid vector data (e.g., NaN, non-number)')
   }
 }
 ```
@@ -356,18 +469,53 @@ for await (const record of streamJsonLines<MyType>(stream)) {
 }
 ```
 
+### Vector Utilities
+
+```typescript
+import {
+  cosineSimilarity,
+  euclideanDistance,
+  dotProduct,
+  normalizeVector,
+  validateVector
+} from 'coldbase'
+
+// Cosine similarity (-1 to 1)
+const similarity = cosineSimilarity([1, 0, 0], [0.9, 0.1, 0])  // ~0.99
+
+// Euclidean distance (>= 0)
+const distance = euclideanDistance([0, 0], [3, 4])  // 5
+
+// Dot product
+const dot = dotProduct([1, 2, 3], [4, 5, 6])  // 32
+
+// Normalize to unit length
+const unit = normalizeVector([3, 4])  // [0.6, 0.8]
+
+// Validate vector (throws on invalid)
+validateVector([1, 2, 3], 3)  // OK
+validateVector([1, 2], 3)     // Throws VectorDimensionError
+validateVector([1, NaN], 2)   // Throws InvalidVectorError
+```
+
 ## Architecture
 
 ### Storage Layout
 
 ```
-users.jsonl           # Compacted user records (NDJSON)
-users.lock            # Distributed lock file (lease-based)
-users.idx             # Index file for fast lookups (optional)
-users.bloom           # Bloom filter for "not exists" checks (optional)
-posts.jsonl           # Compacted post records
+users.jsonl              # Compacted user records (NDJSON)
+users.lock               # Distributed lock file (lease-based)
+users.idx                # Index file for fast lookups (optional)
+users.bloom              # Bloom filter for "not exists" checks (optional)
 users.mutation.ts-uuid1  # Pending mutations (timestamp prefixed)
 users.mutation.ts-uuid2
+embeddings.jsonl         # Vector collection (same NDJSON format)
+embeddings.mutation.*    # Vector mutations
+```
+
+Vector collections use the same storage format as regular collections:
+```json
+["doc1", {"id":"doc1","vector":[0.1,0.2,...],"text":"Hello"}, 1706400000000]
 ```
 
 ### Write Path
@@ -417,12 +565,16 @@ users.mutation.ts-uuid2
    ```
 3. **Use `batch()` for writes** - Coalesces multiple writes into single mutation file
    ```typescript
-   await collection.batch(tx => { tx.put(...); tx.put(...); })
+   await collection.batch(tx => { tx.put({ id: '1', ... }); tx.put({ id: '2', ... }); })
    ```
 4. **Run compaction frequently** - More mutations = slower reads, stale index
 5. **Use `getMany()`** - Single scan for multiple IDs
 6. **Set appropriate TTLs** - Auto-expire old data
 7. **Tune `vacuumCacheSize`** - Larger cache = better deduplication during vacuum
+8. **Vector search with filters** - Apply metadata filters to reduce comparisons
+   ```typescript
+   await embeddings.search(query, { filter: { category: 'news' } })
+   ```
 
 ## Limitations
 
@@ -431,3 +583,4 @@ users.mutation.ts-uuid2
 - **Memory**: Vacuum uses LRU cache (default 100k IDs); overflow IDs aren't fully deduplicated
 - **No Transactions**: Operations are atomic per collection, not across collections
 - **Bloom Filter False Positives**: ~1% false positive rate by default (configurable)
+- **Vector Search**: Uses brute-force search (O(n)); suitable for 10k-100k vectors, not millions

@@ -3,6 +3,38 @@ export interface Document {
   [key: string]: unknown
 }
 
+export interface VectorDocument {
+  id: string
+  vector: number[]
+  [key: string]: unknown
+}
+
+export type SimilarityMetric = 'cosine' | 'euclidean' | 'dotProduct'
+
+export interface CollectionOptions {
+  ttlField?: string
+}
+
+export interface VectorCollectionOptions {
+  dimension: number
+  metric?: SimilarityMetric  // default: 'cosine'
+  normalize?: boolean        // default: true for cosine
+  ttlField?: string
+}
+
+export interface SearchOptions<T> {
+  limit?: number
+  threshold?: number
+  filter?: Partial<T> | ((item: T) => boolean)
+  includeVector?: boolean
+}
+
+export interface SearchResult<T> {
+  id: string
+  score: number
+  data: T
+}
+
 export interface MutationRecord<T = unknown> {
   id: string
   data: T | null

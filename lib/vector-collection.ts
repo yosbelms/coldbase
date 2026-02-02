@@ -5,19 +5,24 @@ import { CollectionCompactor, CompactResult, VacuumResult } from './compactor'
 import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter } from './utils'
 import { SizeLimitError, LockActiveError } from './errors'
 import {
-  DbOptions,
   DbHooks,
-  QueryOptions,
-  DEFAULT_CONFIG,
   MutationBatch,
   CompactorConfig,
   AutoMaintenanceOptions,
   AutoVacuumOptions,
   VectorDocument,
   VectorCollectionOptions,
-  CollectionOptions
+  SearchOptions,
+  SearchResult,
+  SimilarityMetric
 } from './types'
-import { VectorCollection } from './vector-collection'
+import {
+  cosineSimilarity,
+  euclideanDistance,
+  dotProduct,
+  normalizeVector,
+  validateVector
+} from './vector-utils'
 
 /** Index entry mapping ID to byte offset and length in main file */
 interface IndexEntry {
@@ -26,20 +31,12 @@ interface IndexEntry {
 }
 
 /** Transaction interface for batching multiple writes */
-export interface BatchTransaction<T extends { id: string }> {
+export interface VectorBatchTransaction<T extends VectorDocument> {
   put(data: T): void
   delete(id: string): void
 }
 
-export { DbOptions }
-
-export interface MaintenanceSchedule {
-  compactIntervalMs?: number   // How often to run compact (default: 60000 = 1 min)
-  vacuumIntervalMs?: number    // How often to run vacuum (default: 300000 = 5 min)
-  onError?: (error: Error, operation: 'compact' | 'vacuum') => void
-}
-
-interface CollectionConfig {
+interface VectorCollectionConfig {
   maxMutationSize: number
   retryOptions?: {
     maxAttempts?: number
@@ -56,14 +53,14 @@ interface CollectionConfig {
 }
 
 /**
- * Serverless-friendly collection. Each operation reads directly from storage
- * without relying on in-memory state that won't persist between invocations.
+ * Vector collection for storing and searching vector embeddings.
+ * Uses brute-force (exact) similarity search.
  */
-export class Collection<T extends { id: string }> {
+export class VectorCollection<T extends VectorDocument> {
   private ttlField?: keyof T & string
   private maintenanceTimers: { compact?: NodeJS.Timeout; vacuum?: NodeJS.Timeout } = {}
   private compactor: CollectionCompactor
-  private logger = getLogger(['coldbase', 'collection'])
+  private logger = getLogger(['coldbase', 'vector-collection'])
 
   // Cached index and bloom filter (lazily loaded)
   private cachedIndex?: Record<string, IndexEntry>
@@ -72,19 +69,30 @@ export class Collection<T extends { id: string }> {
   private indexValid = false
   private bloomFilterValid = false
 
+  // Vector-specific options
+  private dimension: number
+  private metric: SimilarityMetric
+  private normalizeOnInsert: boolean
+
   constructor(
     private driver: StorageDriver,
     private name: string,
-    private config: CollectionConfig,
-    private hooks?: DbHooks,
-    options?: CollectionOptions
+    private config: VectorCollectionConfig,
+    private vectorOptions: VectorCollectionOptions,
+    private hooks?: DbHooks
   ) {
     const bloomConfig = config.useBloomFilter
       ? { expectedItems: config.bloomFilterExpectedItems, falsePositiveRate: config.bloomFilterFalsePositiveRate }
       : undefined
     this.compactor = new CollectionCompactor(driver, config.compactorConfig, bloomConfig)
-    if (options?.ttlField) {
-      this.ttlField = options.ttlField as keyof T & string
+
+    // Vector-specific initialization
+    this.dimension = vectorOptions.dimension
+    this.metric = vectorOptions.metric ?? 'cosine'
+    // Default: normalize for cosine similarity (unless explicitly set)
+    this.normalizeOnInsert = vectorOptions.normalize ?? (this.metric === 'cosine')
+    if (vectorOptions.ttlField) {
+      this.ttlField = vectorOptions.ttlField as keyof T & string
     }
   }
 
@@ -150,17 +158,11 @@ export class Collection<T extends { id: string }> {
   /**
    * Batch multiple writes into a single mutation file.
    * Use this to reduce the number of mutation files and improve performance.
-   *
-   * @example
-   * await collection.batch(async (tx) => {
-   *   tx.put('1', { id: '1', name: 'Alice' })
-   *   tx.put('2', { id: '2', name: 'Bob' })
-   * })
    */
-  async batch(fn: (tx: BatchTransaction<T>) => void | Promise<void>): Promise<void> {
+  async batch(fn: (tx: VectorBatchTransaction<T>) => void | Promise<void>): Promise<void> {
     const items: { id: string; data: T | null }[] = []
 
-    const tx: BatchTransaction<T> = {
+    const tx: VectorBatchTransaction<T> = {
       put: (data: T) => {
         items.push({ id: data.id, data })
       },
@@ -185,9 +187,21 @@ export class Collection<T extends { id: string }> {
   }
 
   private async _writeMutations(items: { id: string; data: T | null }[]): Promise<void> {
-    this.logger.debug('Writing {count} items to collection {name}', { count: items.length, name: this.name })
+    this.logger.debug('Writing {count} items to vector collection {name}', { count: items.length, name: this.name })
     const now = Date.now()
-    const payload: MutationBatch = items.map(({ id, data }) => [id, data, now])
+
+    // Validate and optionally normalize vectors
+    const processedItems = items.map(({ id, data }) => {
+      if (data !== null) {
+        validateVector(data.vector, this.dimension)
+        if (this.normalizeOnInsert) {
+          data = { ...data, vector: normalizeVector(data.vector) }
+        }
+      }
+      return { id, data }
+    })
+
+    const payload: MutationBatch = processedItems.map(({ id, data }) => [id, data, now])
     const json = JSON.stringify(payload)
 
     if (json.length > this.config.maxMutationSize) {
@@ -322,11 +336,6 @@ export class Collection<T extends { id: string }> {
 
   /**
    * Get a single record by ID.
-   *
-   * Performance optimizations:
-   * - If bloom filter is enabled and says ID doesn't exist, returns immediately
-   * - If index is enabled and no pending mutations, uses direct byte offset lookup
-   * - Otherwise falls back to full scan
    */
   async get(id: string, options: { at?: number } = {}): Promise<T | undefined> {
     this.logger.debug('Getting item {id} from {name}', { id, name: this.name })
@@ -390,7 +399,6 @@ export class Collection<T extends { id: string }> {
     return result
   }
 
-
   /**
    * Get multiple records by IDs. Single scan for all requested IDs.
    */
@@ -415,11 +423,104 @@ export class Collection<T extends { id: string }> {
   }
 
   /**
+   * Perform similarity search on the vector collection.
+   * Returns results sorted by similarity (descending for cosine/dot, ascending for euclidean).
+   */
+  async search(queryVector: number[], options: SearchOptions<T> = {}): Promise<SearchResult<T>[]> {
+    const { limit = 10, threshold, filter, includeVector = false } = options
+
+    // Validate query vector
+    validateVector(queryVector, this.dimension)
+
+    // Normalize query vector for cosine similarity
+    const normalizedQuery = this.metric === 'cosine' ? normalizeVector(queryVector) : queryVector
+
+    const candidates: Array<{ id: string; score: number; data: T }> = []
+
+    // Build map of latest values (handles updates/deletes)
+    const latest = new Map<string, T | null>()
+    for await (const { id, data } of this.read()) {
+      latest.set(id, data)
+    }
+
+    // Compute similarity for each document
+    for (const [id, data] of latest) {
+      if (data === null || this.isExpired(data)) continue
+
+      // Apply metadata filter
+      if (filter) {
+        if (typeof filter === 'function') {
+          if (!filter(data)) continue
+        } else {
+          let match = true
+          for (const [key, val] of Object.entries(filter)) {
+            if ((data as Record<string, unknown>)[key] !== val) {
+              match = false
+              break
+            }
+          }
+          if (!match) continue
+        }
+      }
+
+      // Compute similarity score
+      let score: number
+      switch (this.metric) {
+        case 'cosine':
+          // For normalized vectors, dot product equals cosine similarity
+          score = dotProduct(normalizedQuery, data.vector)
+          break
+        case 'euclidean':
+          score = euclideanDistance(normalizedQuery, data.vector)
+          break
+        case 'dotProduct':
+          score = dotProduct(normalizedQuery, data.vector)
+          break
+      }
+
+      // Apply threshold filter
+      if (threshold !== undefined) {
+        if (this.metric === 'euclidean') {
+          // For euclidean, lower is better, so threshold is max distance
+          if (score > threshold) continue
+        } else {
+          // For cosine/dot, higher is better, so threshold is min similarity
+          if (score < threshold) continue
+        }
+      }
+
+      candidates.push({ id, score, data })
+    }
+
+    // Sort by score
+    if (this.metric === 'euclidean') {
+      // Lower distance is better
+      candidates.sort((a, b) => a.score - b.score)
+    } else {
+      // Higher similarity is better
+      candidates.sort((a, b) => b.score - a.score)
+    }
+
+    // Take top N results
+    const results = candidates.slice(0, limit)
+
+    // Optionally strip vectors from results
+    if (!includeVector) {
+      return results.map(({ id, score, data }) => {
+        const { vector: _, ...rest } = data
+        return { id, score, data: rest as T }
+      })
+    }
+
+    return results
+  }
+
+  /**
    * Query records with optional filtering and pagination.
    * Streams through storage, applying filters without loading all into memory.
    */
-  async find(options: QueryOptions<T> = {}): Promise<T[]> {
-    const { where, limit, offset = 0, at } = options
+  async find(options: { where?: Partial<T> | ((item: T) => boolean); limit?: number; offset?: number; at?: number; includeVector?: boolean } = {}): Promise<T[]> {
+    const { where, limit, offset = 0, at, includeVector = false } = options
     const latest = new Map<string, T | null>()
 
     // Build map of latest values
@@ -446,7 +547,14 @@ export class Collection<T extends { id: string }> {
           if (!match) continue
         }
       }
-      results.push(data)
+
+      // Optionally strip vectors
+      if (!includeVector) {
+        const { vector: _, ...rest } = data
+        results.push(rest as T)
+      } else {
+        results.push(data)
+      }
     }
 
     if (offset || limit) {
@@ -479,14 +587,13 @@ export class Collection<T extends { id: string }> {
     let token: string | undefined
     do {
       const list = await this.driver.list(`${this.name}.mutation.`, token)
-      
-      // Process keys in chunks to avoid waiting for all mutations to load (#1 Performance)
+
+      // Process keys in chunks to avoid waiting for all mutations to load
       const keyChunks = chunk(list.keys, 50)
 
       for (const keyBatch of keyChunks) {
         const results = await parallelLimit(keyBatch, 10, async (key) => {
           // Check timestamp in filename if available to skip early
-          // Format: name.mutation.TIMESTAMP-UUID
           if (at !== undefined) {
             const match = key.match(/\.mutation\.(\d+)-/)
             if (match) {
@@ -508,7 +615,6 @@ export class Collection<T extends { id: string }> {
           if (batch && Array.isArray(batch)) {
             for (const record of batch) {
               const [id, data, ts] = record
-              // Filter by specific record timestamp if available, fallback to file check
               if (at !== undefined && ts !== undefined && ts > at) continue
               yield { id, data: data as T | null, timestamp: ts }
             }
@@ -563,12 +669,13 @@ export class Collection<T extends { id: string }> {
     return toDelete.length
   }
 
-  async compact(): Promise<void> {
+  async compact(): Promise<CompactResult> {
     this.logger.info('Starting manual compaction for {name}', { name: this.name })
     try {
       const result = await this.compactor.compact(this.name)
       this.hooks?.onCompact?.(this.name, result.durationMs, result.mutationsProcessed)
       this.logger.info('Compaction finished for {name} in {duration}ms, processed {count} mutations', { name: this.name, duration: result.durationMs, count: result.mutationsProcessed })
+      return result
     } catch (e) {
       this.hooks?.onError?.(e as Error, 'compact')
       this.logger.error('Compaction failed for {name}: {error}', { name: this.name, error: e })
@@ -576,49 +683,17 @@ export class Collection<T extends { id: string }> {
     }
   }
 
-  async vacuum(): Promise<void> {
+  async vacuum(): Promise<VacuumResult> {
     this.logger.info('Starting manual vacuum for {name}', { name: this.name })
     try {
       const result = await this.compactor.vacuum(this.name)
       this.hooks?.onVacuum?.(this.name, result.durationMs, result.recordsRemoved)
       this.logger.info('Vacuum finished for {name} in {duration}ms, removed {count} records', { name: this.name, duration: result.durationMs, count: result.recordsRemoved })
+      return result
     } catch (e) {
       this.hooks?.onError?.(e as Error, 'vacuum')
       this.logger.error('Vacuum failed for {name}: {error}', { name: this.name, error: e })
       throw e
-    }
-  }
-
-  startMaintenance(schedule: MaintenanceSchedule): void {
-    this.logger.info('Starting maintenance for {name}', { name: this.name })
-    this.stopMaintenance()
-
-    if (schedule.compactIntervalMs) {
-      this.maintenanceTimers.compact = setInterval(() => {
-        this.logger.debug('Running scheduled compaction for {name}', { name: this.name })
-        this.compact().catch(err => {
-          if (err instanceof LockActiveError) {
-            this.logger.debug('Compaction skipped for {name} (lock active)', { name: this.name })
-            return
-          }
-          this.logger.error('Scheduled compaction failed for {name}: {error}', { name: this.name, error: err })
-          schedule.onError?.(err, 'compact')
-        })
-      }, schedule.compactIntervalMs)
-    }
-
-    if (schedule.vacuumIntervalMs) {
-      this.maintenanceTimers.vacuum = setInterval(() => {
-        this.logger.debug('Running scheduled vacuum for {name}', { name: this.name })
-        this.vacuum().catch(err => {
-          if (err instanceof LockActiveError) {
-            this.logger.debug('Vacuum skipped for {name} (lock active)', { name: this.name })
-            return
-          }
-          this.logger.error('Scheduled vacuum failed for {name}: {error}', { name: this.name, error: err })
-          schedule.onError?.(err, 'vacuum')
-        })
-      }, schedule.vacuumIntervalMs)
     }
   }
 
@@ -635,114 +710,5 @@ export class Collection<T extends { id: string }> {
     if (!this.ttlField) return false
     const expiresAt = data[this.ttlField] as unknown as number
     return expiresAt !== undefined && expiresAt < Date.now()
-  }
-}
-
-export class Db {
-  private collections = new Map<string, Collection<any>>()
-  private vectorCollections = new Map<string, VectorCollection<any>>()
-  private compactorConfig: typeof DEFAULT_CONFIG
-  private collectionConfig: CollectionConfig
-  private hooks?: DbHooks
-  private logger = getLogger(['coldbase', 'db'])
-
-  constructor(
-    private driver: StorageDriver,
-    options: DbOptions = {}
-  ) {
-    const { autoCompact = false, autoVacuum = false, hooks, retryOptions, ...config } = options
-    this.compactorConfig = { ...DEFAULT_CONFIG, ...config }
-    this.collectionConfig = {
-      maxMutationSize: this.compactorConfig.maxMutationSize,
-      retryOptions,
-      autoCompact,
-      autoVacuum,
-      compactorConfig: this.compactorConfig,
-      useIndex: this.compactorConfig.useIndex,
-      useBloomFilter: this.compactorConfig.useBloomFilter,
-      bloomFilterExpectedItems: this.compactorConfig.bloomFilterExpectedItems,
-      bloomFilterFalsePositiveRate: this.compactorConfig.bloomFilterFalsePositiveRate
-    }
-    this.hooks = hooks
-    this.logger.debug('Db initialized with options: {options}', { options })
-  }
-
-  collection<T extends { id: string }>(name: string, options?: CollectionOptions): Collection<T> {
-    let col = this.collections.get(name)
-    if (!col) {
-      this.logger.debug('Creating collection instance {name}', { name })
-      col = new Collection<T>(
-        this.driver,
-        name,
-        this.collectionConfig,
-        this.hooks,
-        options
-      )
-      this.collections.set(name, col)
-    }
-    return col as Collection<T>
-  }
-
-  vectorCollection<T extends VectorDocument>(
-    name: string,
-    options: VectorCollectionOptions
-  ): VectorCollection<T> {
-    let col = this.vectorCollections.get(name)
-    if (!col) {
-      this.logger.debug('Creating vector collection instance {name}', { name })
-      col = new VectorCollection<T>(
-        this.driver,
-        name,
-        this.collectionConfig,
-        options,
-        this.hooks
-      )
-      this.vectorCollections.set(name, col)
-    }
-    return col as VectorCollection<T>
-  }
-
-  /**
-   * Compact pending mutations into the main file.
-   * In serverless, call this from a scheduled function rather than inline.
-   */
-  async compact(name: string): Promise<CompactResult> {
-    this.logger.info('Starting DB-level compaction for {name}', { name })
-    const bloomConfig = this.collectionConfig.useBloomFilter
-      ? { expectedItems: this.collectionConfig.bloomFilterExpectedItems, falsePositiveRate: this.collectionConfig.bloomFilterFalsePositiveRate }
-      : undefined
-    const compactor = new CollectionCompactor(this.driver, this.compactorConfig, bloomConfig)
-    try {
-      const result = await compactor.compact(name)
-      this.hooks?.onCompact?.(name, result.durationMs, result.mutationsProcessed)
-      this.logger.info('DB-level compaction finished for {name}', { name })
-      return result
-    } catch (e) {
-      this.hooks?.onError?.(e as Error, 'compact')
-      this.logger.error('DB-level compaction failed for {name}: {error}', { name, error: e })
-      throw e
-    }
-  }
-
-  /**
-   * Remove duplicates and deleted records from the main file.
-   * In serverless, call this from a scheduled function.
-   */
-  async vacuum(name: string): Promise<VacuumResult> {
-    this.logger.info('Starting DB-level vacuum for {name}', { name })
-    const bloomConfig = this.collectionConfig.useBloomFilter
-      ? { expectedItems: this.collectionConfig.bloomFilterExpectedItems, falsePositiveRate: this.collectionConfig.bloomFilterFalsePositiveRate }
-      : undefined
-    const compactor = new CollectionCompactor(this.driver, this.compactorConfig, bloomConfig)
-    try {
-      const result = await compactor.vacuum(name)
-      this.hooks?.onVacuum?.(name, result.durationMs, result.recordsRemoved)
-      this.logger.info('DB-level vacuum finished for {name}', { name })
-      return result
-    } catch (e) {
-      this.hooks?.onError?.(e as Error, 'vacuum')
-      this.logger.error('DB-level vacuum failed for {name}: {error}', { name, error: e })
-      throw e
-    }
   }
 }
