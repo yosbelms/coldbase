@@ -1,5 +1,6 @@
 import { Db, Collection } from '../lib/db'
 import { FileSystemDriver } from '../lib/drivers/fs'
+import { TransactionError } from '../lib/errors'
 import { streamToString } from '../lib/utils'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -282,5 +283,189 @@ describe('Size limits', () => {
     await expect(
       col.put({ id: '1', data: largeData })
     ).rejects.toThrow('Payload size')
+  })
+})
+
+describe('Transaction', () => {
+  let tmpDir: string
+  let driver: FileSystemDriver
+  let db: Db
+
+  beforeEach(async () => {
+    tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'coldbase-tx-test-'))
+    driver = new FileSystemDriver(tmpDir)
+    db = new Db(driver, { autoCompact: false })
+  })
+
+  afterEach(async () => {
+    await fs.promises.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('commits writes across multiple collections on success', async () => {
+    await db.transaction(async (tx) => {
+      const users = tx.collection<{ id: string; name: string }>('users')
+      const logs = tx.collection<{ id: string; action: string }>('logs')
+
+      await users.put({ id: '1', name: 'Alice' })
+      await logs.put({ id: 'log-1', action: 'user-created' })
+    })
+
+    const users = db.collection<{ id: string; name: string }>('users')
+    const logs = db.collection<{ id: string; action: string }>('logs')
+
+    expect(await users.get('1')).toEqual({ id: '1', name: 'Alice' })
+    expect(await logs.get('log-1')).toEqual({ id: 'log-1', action: 'user-created' })
+  })
+
+  test('compensates all writes on failure', async () => {
+    await expect(
+      db.transaction(async (tx) => {
+        const users = tx.collection<{ id: string; name: string }>('users')
+        const logs = tx.collection<{ id: string; action: string }>('logs')
+
+        await users.put({ id: '1', name: 'Alice' })
+        await logs.put({ id: 'log-1', action: 'user-created' })
+
+        throw new Error('Simulated failure')
+      })
+    ).rejects.toThrow(TransactionError)
+
+    const users = db.collection<{ id: string; name: string }>('users')
+    const logs = db.collection<{ id: string; action: string }>('logs')
+
+    expect(await users.get('1')).toBeUndefined()
+    expect(await logs.get('log-1')).toBeUndefined()
+  })
+
+  test('compensation restores previous values', async () => {
+    const users = db.collection<{ id: string; name: string }>('users')
+    await users.put({ id: '1', name: 'Original' })
+
+    await expect(
+      db.transaction(async (tx) => {
+        const txUsers = tx.collection<{ id: string; name: string }>('users')
+        await txUsers.put({ id: '1', name: 'Updated' })
+        throw new Error('Simulated failure')
+      })
+    ).rejects.toThrow(TransactionError)
+
+    expect(await users.get('1')).toEqual({ id: '1', name: 'Original' })
+  })
+
+  test('TransactionError contains original error and empty compensation errors on clean rollback', async () => {
+    try {
+      await db.transaction(async (tx) => {
+        const users = tx.collection<{ id: string; name: string }>('users')
+        await users.put({ id: '1', name: 'Alice' })
+        throw new Error('Original failure')
+      })
+      fail('Expected TransactionError')
+    } catch (err) {
+      expect(err).toBeInstanceOf(TransactionError)
+      const txErr = err as TransactionError
+      expect(txErr.originalError.message).toBe('Original failure')
+      expect(txErr.compensationErrors).toHaveLength(0)
+      expect(txErr.message).toBe('Transaction failed, all compensations succeeded')
+    }
+  })
+
+  test('compensation errors are collected in TransactionError.compensationErrors', async () => {
+    // Pre-populate so compensation (re-put) will be attempted
+    const users = db.collection<{ id: string; name: string }>('users')
+    await users.put({ id: '1', name: 'Original' })
+
+    // Sabotage the driver to make compensation fail
+    const originalPut = driver.put.bind(driver)
+    let callCount = 0
+
+    try {
+      await db.transaction(async (tx) => {
+        const txUsers = tx.collection<{ id: string; name: string }>('users')
+        await txUsers.put({ id: '1', name: 'Updated' })
+
+        // After the successful put, sabotage subsequent puts so compensation fails
+        driver.put = async (...args: Parameters<typeof driver.put>) => {
+          callCount++
+          if (callCount > 0) {
+            throw new Error('Storage failure')
+          }
+          return originalPut(...args)
+        }
+
+        throw new Error('Original failure')
+      })
+      fail('Expected TransactionError')
+    } catch (err) {
+      expect(err).toBeInstanceOf(TransactionError)
+      const txErr = err as TransactionError
+      expect(txErr.originalError.message).toBe('Original failure')
+      expect(txErr.compensationErrors).toHaveLength(1)
+      expect(txErr.compensationErrors[0].message).toBe('Storage failure')
+      expect(txErr.message).toContain('1 compensation(s) also failed')
+    } finally {
+      driver.put = originalPut
+    }
+  })
+
+  test('nested transaction commits promote compensations to parent', async () => {
+    await db.transaction(async (tx) => {
+      const users = tx.collection<{ id: string; name: string }>('users')
+      await users.put({ id: '1', name: 'Alice' })
+
+      await tx.transaction(async (inner) => {
+        const logs = inner.collection<{ id: string; action: string }>('logs')
+        await logs.put({ id: 'log-1', action: 'created' })
+      })
+    })
+
+    const users = db.collection<{ id: string; name: string }>('users')
+    const logs = db.collection<{ id: string; action: string }>('logs')
+    expect(await users.get('1')).toEqual({ id: '1', name: 'Alice' })
+    expect(await logs.get('log-1')).toEqual({ id: 'log-1', action: 'created' })
+  })
+
+  test('nested transaction failure only rolls back inner writes', async () => {
+    await expect(
+      db.transaction(async (tx) => {
+        const users = tx.collection<{ id: string; name: string }>('users')
+        await users.put({ id: '1', name: 'Alice' })
+
+        try {
+          await tx.transaction(async (inner) => {
+            const logs = inner.collection<{ id: string; action: string }>('logs')
+            await logs.put({ id: 'log-1', action: 'created' })
+            throw new Error('Inner failure')
+          })
+        } catch {
+          // Swallow inner failure, outer continues
+        }
+      })
+    ).resolves.toBeUndefined()
+
+    const users = db.collection<{ id: string; name: string }>('users')
+    const logs = db.collection<{ id: string; action: string }>('logs')
+    expect(await users.get('1')).toEqual({ id: '1', name: 'Alice' })
+    expect(await logs.get('log-1')).toBeUndefined()
+  })
+
+  test('outer failure rolls back both outer and promoted inner compensations', async () => {
+    await expect(
+      db.transaction(async (tx) => {
+        const users = tx.collection<{ id: string; name: string }>('users')
+        await users.put({ id: '1', name: 'Alice' })
+
+        await tx.transaction(async (inner) => {
+          const logs = inner.collection<{ id: string; action: string }>('logs')
+          await logs.put({ id: 'log-1', action: 'created' })
+        })
+
+        throw new Error('Outer failure after nested commit')
+      })
+    ).rejects.toThrow(TransactionError)
+
+    const users = db.collection<{ id: string; name: string }>('users')
+    const logs = db.collection<{ id: string; action: string }>('logs')
+    expect(await users.get('1')).toBeUndefined()
+    expect(await logs.get('log-1')).toBeUndefined()
   })
 })

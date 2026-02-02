@@ -5,7 +5,7 @@ export { FileSystemDriver } from './drivers/fs'
 export { AzureBlobDriver } from './drivers/azure'
 
 // Core
-export { Db, Collection, DbOptions } from './db'
+export { Db, Collection, DbOptions, TransactionalCollection, TransactionContext } from './db'
 export { VectorCollection } from './vector-collection'
 export { CollectionCompactor, CompactorConfig, CompactResult, VacuumResult } from './compactor'
 
@@ -40,7 +40,8 @@ export {
   SizeLimitError,
   CorruptionError,
   VectorDimensionError,
-  InvalidVectorError
+  InvalidVectorError,
+  TransactionError
 } from './errors'
 
 // Utilities

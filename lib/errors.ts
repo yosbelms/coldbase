@@ -70,3 +70,17 @@ export class InvalidVectorError extends ValidationError {
     this.name = 'InvalidVectorError'
   }
 }
+
+export class TransactionError extends MiniDbError {
+  constructor(
+    public readonly originalError: Error,
+    public readonly compensationErrors: Error[]
+  ) {
+    super(
+      compensationErrors.length > 0
+        ? `Transaction failed and ${compensationErrors.length} compensation(s) also failed`
+        : 'Transaction failed, all compensations succeeded'
+    )
+    this.name = 'TransactionError'
+  }
+}

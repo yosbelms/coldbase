@@ -3,7 +3,7 @@ import { getLogger } from '@logtape/logtape'
 import { StorageDriver } from './drivers/interface'
 import { CollectionCompactor, CompactResult, VacuumResult } from './compactor'
 import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter } from './utils'
-import { SizeLimitError, LockActiveError } from './errors'
+import { SizeLimitError, LockActiveError, TransactionError } from './errors'
 import {
   DbOptions,
   DbHooks,
@@ -29,6 +29,17 @@ interface IndexEntry {
 export interface BatchTransaction<T extends { id: string }> {
   put(data: T): void
   delete(id: string): void
+}
+
+export interface TransactionalCollection<T extends { id: string }> {
+  put(data: T): Promise<void>
+  delete(id: string): Promise<void>
+  get(id: string): Promise<T | undefined>
+}
+
+export interface TransactionContext {
+  collection<T extends { id: string }>(name: string, options?: CollectionOptions): TransactionalCollection<T>
+  transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<void>
 }
 
 export { DbOptions }
@@ -743,6 +754,84 @@ export class Db {
       this.hooks?.onError?.(e as Error, 'vacuum')
       this.logger.error('DB-level vacuum failed for {name}: {error}', { name, error: e })
       throw e
+    }
+  }
+
+  /**
+   * Execute a cross-collection transaction using the saga pattern.
+   * Each write records a compensation action; if any step fails,
+   * compensations run in reverse order to undo previous writes.
+   * Supports nesting: inner transactions act as savepoints.
+   */
+  async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<void> {
+    return this.executeTransaction(fn, null)
+  }
+
+  private async executeTransaction(
+    fn: (tx: TransactionContext) => Promise<void>,
+    parentCompensations: (() => Promise<void>)[] | null
+  ): Promise<void> {
+    const compensations: (() => Promise<void>)[] = []
+
+    const tx: TransactionContext = {
+      collection: <T extends { id: string }>(name: string, options?: CollectionOptions): TransactionalCollection<T> => {
+        const col = this.collection<T>(name, options)
+
+        return {
+          async put(data: T): Promise<void> {
+            const old = await col.get(data.id)
+            await col.put(data)
+            if (old !== undefined) {
+              compensations.push(() => col.put(old))
+            } else {
+              compensations.push(() => col.delete(data.id))
+            }
+          },
+
+          async delete(id: string): Promise<void> {
+            const old = await col.get(id)
+            await col.delete(id)
+            if (old !== undefined) {
+              compensations.push(() => col.put(old))
+            }
+          },
+
+          get(id: string): Promise<T | undefined> {
+            return col.get(id)
+          }
+        }
+      },
+
+      transaction: (innerFn: (tx: TransactionContext) => Promise<void>): Promise<void> => {
+        return this.executeTransaction(innerFn, compensations)
+      }
+    }
+
+    try {
+      await fn(tx)
+    } catch (error) {
+      const compensationErrors: Error[] = []
+
+      // Ensure compensation mutations get a strictly later timestamp
+      // so they sort after the original writes in the WAL
+      await new Promise(resolve => setTimeout(resolve, 1))
+
+      for (let i = compensations.length - 1; i >= 0; i--) {
+        try {
+          await compensations[i]()
+        } catch (compError) {
+          compensationErrors.push(compError as Error)
+        }
+      }
+
+      // If nested, propagate as TransactionError so the parent can handle it
+      throw new TransactionError(error as Error, compensationErrors)
+    }
+
+    // On success, promote compensations to parent so they roll back
+    // if a later step in the outer transaction fails
+    if (parentCompensations) {
+      parentCompensations.push(...compensations)
     }
   }
 }

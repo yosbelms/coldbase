@@ -11,6 +11,7 @@ A lightweight, serverless-first write-ahead log (WAL) database for cloud storage
 - **Query API**: `find()` with filtering, pagination, and function predicates
 - **TTL Support**: Auto-expire records based on a timestamp field
 - **Batch Operations**: `getMany()` for efficient multi-key lookups, `batch()` for coalescing writes
+- **Transactions**: Cross-collection atomicity via saga pattern with automatic compensation on failure
 - **Parallel Processing**: Configurable parallelism for mutation processing
 - **Retry Logic**: Exponential backoff with jitter for transient failures
 - **Hooks & Metrics**: Monitor writes, compactions, and errors
@@ -285,6 +286,58 @@ users.startMaintenance({
 users.stopMaintenance()
 ```
 The maintenance task automatically handles `LockActiveError` by silently skipping the operation if another process is already performing maintenance.
+
+### Transactions
+
+Cross-collection atomicity using the saga pattern. Each write tracks a compensation action; if any step fails, compensations run in reverse order to undo previous writes.
+
+```typescript
+await db.transaction(async (tx) => {
+  const users = tx.collection<User>('users')
+  const logs = tx.collection<Log>('logs')
+
+  await users.put({ id: '1', name: 'Alice' })
+  await logs.put({ id: 'log-1', action: 'user-created' })
+})
+// If logs.put fails → users.put is compensated (deleted)
+```
+
+The transactional collection supports `put`, `delete`, and `get` (read-only, no tracking). On failure, a `TransactionError` is thrown containing the original error and any compensation errors:
+
+```typescript
+import { TransactionError } from 'coldbase'
+
+try {
+  await db.transaction(async (tx) => { /* ... */ })
+} catch (e) {
+  if (e instanceof TransactionError) {
+    console.log(e.originalError)        // The error that caused the rollback
+    console.log(e.compensationErrors)   // Any errors during compensation
+  }
+}
+```
+
+**Nested Transactions (Savepoints):**
+
+Transactions can be nested via `tx.transaction()`. A nested transaction acts as a savepoint — if it fails, only its own writes are rolled back while the outer transaction continues. If it succeeds, its compensations are promoted to the parent so they roll back if a later outer step fails.
+
+```typescript
+await db.transaction(async (tx) => {
+  const users = tx.collection<User>('users')
+  await users.put({ id: '1', name: 'Alice' })
+
+  // Nested transaction: if this fails, only inner writes are rolled back
+  try {
+    await tx.transaction(async (inner) => {
+      const logs = inner.collection<Log>('logs')
+      await logs.put({ id: 'log-1', action: 'user-created' })
+      throw new Error('inner failure')
+    })
+  } catch {
+    // Inner rolled back, outer continues — users.put still committed
+  }
+})
+```
 
 ### `VectorCollection<T>`
 
@@ -581,6 +634,6 @@ Vector collections use the same storage format as regular collections:
 - **Read Performance**: Falls back to full scan when mutations are pending or index disabled
 - **Eventual Consistency**: Data is durable immediately but appears in main file after compaction
 - **Memory**: Vacuum uses LRU cache (default 100k IDs); overflow IDs aren't fully deduplicated
-- **No Transactions**: Operations are atomic per collection, not across collections
+- **Saga-Based Transactions**: Cross-collection transactions use best-effort compensation (not true ACID); compensation failures are reported but cannot guarantee rollback
 - **Bloom Filter False Positives**: ~1% false positive rate by default (configurable)
 - **Vector Search**: Uses brute-force search (O(n)); suitable for 10k-100k vectors, not millions
