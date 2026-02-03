@@ -44,14 +44,3 @@ export {
   TransactionError
 } from './errors'
 
-// Utilities
-export { retry, parallelLimit, chunk, streamToString, streamLines, streamJsonLines } from './utils'
-
-// Vector utilities
-export {
-  cosineSimilarity,
-  euclideanDistance,
-  dotProduct,
-  normalizeVector,
-  validateVector
-} from './vector-utils'

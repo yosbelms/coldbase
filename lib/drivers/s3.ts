@@ -232,13 +232,18 @@ export class S3Driver implements StorageDriver {
         })
       )
     } catch (e) {
-      await this.client.send(
-        new AbortMultipartUploadCommand({
-          Bucket: this.bucket,
-          Key: key,
-          UploadId: uploadId
-        })
-      )
+      try {
+        await this.client.send(
+          new AbortMultipartUploadCommand({
+            Bucket: this.bucket,
+            Key: key,
+            UploadId: uploadId
+          })
+        )
+      } catch (abortErr) {
+        this.logger.warn('Failed to abort multipart upload {uploadId} for {key}: {error}',
+          { uploadId, key, error: abortErr })
+      }
       throw e
     }
   }

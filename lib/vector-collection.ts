@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { getLogger } from '@logtape/logtape'
 import { StorageDriver } from './drivers/interface'
 import { CollectionCompactor, CompactResult, VacuumResult } from './compactor'
-import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter } from './utils'
+import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter, monotonicTimestamp, TopKHeap } from './utils'
 import { SizeLimitError, LockActiveError } from './errors'
 import {
   DbHooks,
@@ -188,7 +188,7 @@ export class VectorCollection<T extends VectorDocument> {
 
   private async _writeMutations(items: { id: string; data: T | null }[]): Promise<void> {
     this.logger.debug('Writing {count} items to vector collection {name}', { count: items.length, name: this.name })
-    const now = Date.now()
+    const now = monotonicTimestamp()
 
     // Validate and optionally normalize vectors
     const processedItems = items.map(({ id, data }) => {
@@ -210,7 +210,7 @@ export class VectorCollection<T extends VectorDocument> {
     }
 
     const write = async () => {
-      await this.driver.put(`${this.name}.mutation.${Date.now()}-${randomUUID()}`, json)
+      await this.driver.put(`${this.name}.mutation.${monotonicTimestamp()}-${randomUUID()}`, json)
     }
 
     try {
@@ -435,7 +435,12 @@ export class VectorCollection<T extends VectorDocument> {
     // Normalize query vector for cosine similarity
     const normalizedQuery = this.metric === 'cosine' ? normalizeVector(queryVector) : queryVector
 
-    const candidates: Array<{ id: string; score: number; data: T }> = []
+    // For euclidean, lower is better — heap evicts largest distance (max-heap behavior on root)
+    // For cosine/dot, higher is better — heap evicts lowest similarity (min-heap behavior on root)
+    const compare = this.metric === 'euclidean'
+      ? (a: { id: string; score: number; data: T }, b: { id: string; score: number; data: T }) => b.score - a.score
+      : (a: { id: string; score: number; data: T }, b: { id: string; score: number; data: T }) => a.score - b.score
+    const heap = new TopKHeap<{ id: string; score: number; data: T }>(limit, compare)
 
     // Build map of latest values (handles updates/deletes)
     const latest = new Map<string, T | null>()
@@ -489,20 +494,10 @@ export class VectorCollection<T extends VectorDocument> {
         }
       }
 
-      candidates.push({ id, score, data })
+      heap.push({ id, score, data })
     }
 
-    // Sort by score
-    if (this.metric === 'euclidean') {
-      // Lower distance is better
-      candidates.sort((a, b) => a.score - b.score)
-    } else {
-      // Higher similarity is better
-      candidates.sort((a, b) => b.score - a.score)
-    }
-
-    // Take top N results
-    const results = candidates.slice(0, limit)
+    const results = heap.toSortedArray()
 
     // Optionally strip vectors from results
     if (!includeVector) {
@@ -571,6 +566,15 @@ export class VectorCollection<T extends VectorDocument> {
   async *read(options: { at?: number } = {}): AsyncGenerator<{ id: string; data: T | null; timestamp?: number }> {
     const { at } = options
 
+    // Snapshot mutation keys first to avoid race with compaction.
+    const snapshotKeys: string[] = []
+    let token: string | undefined
+    do {
+      const list = await this.driver.list(`${this.name}.mutation.`, token)
+      snapshotKeys.push(...list.keys)
+      token = list.continuationToken
+    } while (token)
+
     // Stream main file
     const resp = await this.driver.get(`${this.name}.jsonl`)
     if (resp) {
@@ -583,46 +587,39 @@ export class VectorCollection<T extends VectorDocument> {
       }
     }
 
-    // Stream pending mutations
-    let token: string | undefined
-    do {
-      const list = await this.driver.list(`${this.name}.mutation.`, token)
+    // Process snapshotted mutation keys
+    const keyChunks = chunk(snapshotKeys, 50)
 
-      // Process keys in chunks to avoid waiting for all mutations to load
-      const keyChunks = chunk(list.keys, 50)
-
-      for (const keyBatch of keyChunks) {
-        const results = await parallelLimit(keyBatch, 10, async (key) => {
-          // Check timestamp in filename if available to skip early
-          if (at !== undefined) {
-            const match = key.match(/\.mutation\.(\d+)-/)
-            if (match) {
-              const fileTs = parseInt(match[1], 10)
-              if (fileTs > at) return null
-            }
+    for (const keyBatch of keyChunks) {
+      const results = await parallelLimit(keyBatch, 10, async (key) => {
+        // Check timestamp in filename if available to skip early
+        if (at !== undefined) {
+          const match = key.match(/\.mutation\.(\d+)-/)
+          if (match) {
+            const fileTs = parseInt(match[1], 10)
+            if (fileTs > at) return null
           }
+        }
 
-          const mutResp = await this.driver.get(key)
-          if (!mutResp) return null
-          try {
-            return JSON.parse(await streamToString(mutResp.stream)) as MutationBatch
-          } catch {
-            return null
-          }
-        })
+        const mutResp = await this.driver.get(key)
+        if (!mutResp) return null
+        try {
+          return JSON.parse(await streamToString(mutResp.stream)) as MutationBatch
+        } catch {
+          return null
+        }
+      })
 
-        for (const batch of results) {
-          if (batch && Array.isArray(batch)) {
-            for (const record of batch) {
-              const [id, data, ts] = record
-              if (at !== undefined && ts !== undefined && ts > at) continue
-              yield { id, data: data as T | null, timestamp: ts }
-            }
+      for (const batch of results) {
+        if (batch && Array.isArray(batch)) {
+          for (const record of batch) {
+            const [id, data, ts] = record
+            if (at !== undefined && ts !== undefined && ts > at) continue
+            yield { id, data: data as T | null, timestamp: ts }
           }
         }
       }
-      token = list.continuationToken
-    } while (token)
+    }
   }
 
   /**

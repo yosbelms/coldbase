@@ -206,6 +206,10 @@ db.compact(name: string): Promise<CompactResult>
 db.vacuum(name: string): Promise<VacuumResult>
 ```
 
+**Collection Naming Rules:**
+
+Collection names must match `^[a-zA-Z0-9][a-zA-Z0-9_-]*$` and be at most 64 characters. Names containing `.`, `/`, spaces, or starting with `_` or `-` will throw a `ValidationError`. This prevents collisions with internal storage keys (e.g., `.mutation.`, `.jsonl`, `.lock`).
+
 ### `Collection<T>`
 
 **Writing:**
@@ -465,6 +469,7 @@ import {
   MiniDbError,
   PreconditionFailedError,
   LockActiveError,
+  ValidationError,
   SizeLimitError,
   VectorDimensionError,
   InvalidVectorError
@@ -475,6 +480,8 @@ try {
 } catch (e) {
   if (e instanceof LockActiveError) {
     console.log('Another process is compacting')
+  } else if (e instanceof ValidationError) {
+    console.log('Invalid collection name')
   } else if (e instanceof SizeLimitError) {
     console.log('Mutation too large')
   }
@@ -490,65 +497,6 @@ try {
     console.log('Invalid vector data (e.g., NaN, non-number)')
   }
 }
-```
-
-## Utilities
-
-```typescript
-import { retry, parallelLimit, chunk, streamToString, streamLines, streamJsonLines } from 'coldbase'
-
-// Retry with exponential backoff
-const result = await retry(
-  () => fetchData(),
-  { maxAttempts: 5, baseDelayMs: 100, maxDelayMs: 5000 }
-)
-
-// Process items in parallel with concurrency limit
-const results = await parallelLimit(items, 5, async (item) => {
-  return processItem(item)
-})
-
-// Split array into chunks
-const batches = chunk(items, 100)
-
-// Stream lines from a readable stream
-for await (const { line, lineNum } of streamLines(stream)) {
-  console.log(`Line ${lineNum}: ${line}`)
-}
-
-// Stream and parse NDJSON (newline-delimited JSON)
-for await (const record of streamJsonLines<MyType>(stream)) {
-  console.log(record)
-}
-```
-
-### Vector Utilities
-
-```typescript
-import {
-  cosineSimilarity,
-  euclideanDistance,
-  dotProduct,
-  normalizeVector,
-  validateVector
-} from 'coldbase'
-
-// Cosine similarity (-1 to 1)
-const similarity = cosineSimilarity([1, 0, 0], [0.9, 0.1, 0])  // ~0.99
-
-// Euclidean distance (>= 0)
-const distance = euclideanDistance([0, 0], [3, 4])  // 5
-
-// Dot product
-const dot = dotProduct([1, 2, 3], [4, 5, 6])  // 32
-
-// Normalize to unit length
-const unit = normalizeVector([3, 4])  // [0.6, 0.8]
-
-// Validate vector (throws on invalid)
-validateVector([1, 2, 3], 3)  // OK
-validateVector([1, 2], 3)     // Throws VectorDimensionError
-validateVector([1, NaN], 2)   // Throws InvalidVectorError
 ```
 
 ## Architecture

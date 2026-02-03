@@ -2,8 +2,8 @@ import { randomUUID } from 'crypto'
 import { getLogger } from '@logtape/logtape'
 import { StorageDriver } from './drivers/interface'
 import { CollectionCompactor, CompactResult, VacuumResult } from './compactor'
-import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter } from './utils'
-import { SizeLimitError, LockActiveError, TransactionError } from './errors'
+import { streamToString, streamJsonLines, retry, chunk, parallelLimit, BloomFilter, monotonicTimestamp } from './utils'
+import { SizeLimitError, LockActiveError, TransactionError, ValidationError } from './errors'
 import {
   DbOptions,
   DbHooks,
@@ -197,7 +197,7 @@ export class Collection<T extends { id: string }> {
 
   private async _writeMutations(items: { id: string; data: T | null }[]): Promise<void> {
     this.logger.debug('Writing {count} items to collection {name}', { count: items.length, name: this.name })
-    const now = Date.now()
+    const now = monotonicTimestamp()
     const payload: MutationBatch = items.map(({ id, data }) => [id, data, now])
     const json = JSON.stringify(payload)
 
@@ -207,7 +207,7 @@ export class Collection<T extends { id: string }> {
     }
 
     const write = async () => {
-      await this.driver.put(`${this.name}.mutation.${Date.now()}-${randomUUID()}`, json)
+      await this.driver.put(`${this.name}.mutation.${monotonicTimestamp()}-${randomUUID()}`, json)
     }
 
     try {
@@ -474,6 +474,17 @@ export class Collection<T extends { id: string }> {
   async *read(options: { at?: number } = {}): AsyncGenerator<{ id: string; data: T | null; timestamp?: number }> {
     const { at } = options
 
+    // Snapshot mutation keys first to avoid race with compaction.
+    // If compaction runs after this snapshot, data moves to main file
+    // (we'll see it there) and mutation files get deleted (we skip gracefully).
+    const snapshotKeys: string[] = []
+    let token: string | undefined
+    do {
+      const list = await this.driver.list(`${this.name}.mutation.`, token)
+      snapshotKeys.push(...list.keys)
+      token = list.continuationToken
+    } while (token)
+
     // Stream main file
     const resp = await this.driver.get(`${this.name}.jsonl`)
     if (resp) {
@@ -486,48 +497,41 @@ export class Collection<T extends { id: string }> {
       }
     }
 
-    // Stream pending mutations
-    let token: string | undefined
-    do {
-      const list = await this.driver.list(`${this.name}.mutation.`, token)
-      
-      // Process keys in chunks to avoid waiting for all mutations to load (#1 Performance)
-      const keyChunks = chunk(list.keys, 50)
+    // Process snapshotted mutation keys
+    const keyChunks = chunk(snapshotKeys, 50)
 
-      for (const keyBatch of keyChunks) {
-        const results = await parallelLimit(keyBatch, 10, async (key) => {
-          // Check timestamp in filename if available to skip early
-          // Format: name.mutation.TIMESTAMP-UUID
-          if (at !== undefined) {
-            const match = key.match(/\.mutation\.(\d+)-/)
-            if (match) {
-              const fileTs = parseInt(match[1], 10)
-              if (fileTs > at) return null
-            }
+    for (const keyBatch of keyChunks) {
+      const results = await parallelLimit(keyBatch, 10, async (key) => {
+        // Check timestamp in filename if available to skip early
+        // Format: name.mutation.TIMESTAMP-UUID
+        if (at !== undefined) {
+          const match = key.match(/\.mutation\.(\d+)-/)
+          if (match) {
+            const fileTs = parseInt(match[1], 10)
+            if (fileTs > at) return null
           }
+        }
 
-          const mutResp = await this.driver.get(key)
-          if (!mutResp) return null
-          try {
-            return JSON.parse(await streamToString(mutResp.stream)) as MutationBatch
-          } catch {
-            return null
-          }
-        })
+        const mutResp = await this.driver.get(key)
+        if (!mutResp) return null
+        try {
+          return JSON.parse(await streamToString(mutResp.stream)) as MutationBatch
+        } catch {
+          return null
+        }
+      })
 
-        for (const batch of results) {
-          if (batch && Array.isArray(batch)) {
-            for (const record of batch) {
-              const [id, data, ts] = record
-              // Filter by specific record timestamp if available, fallback to file check
-              if (at !== undefined && ts !== undefined && ts > at) continue
-              yield { id, data: data as T | null, timestamp: ts }
-            }
+      for (const batch of results) {
+        if (batch && Array.isArray(batch)) {
+          for (const record of batch) {
+            const [id, data, ts] = record
+            // Filter by specific record timestamp if available, fallback to file check
+            if (at !== undefined && ts !== undefined && ts > at) continue
+            yield { id, data: data as T | null, timestamp: ts }
           }
         }
       }
-      token = list.continuationToken
-    } while (token)
+    }
   }
 
   /**
@@ -649,6 +653,8 @@ export class Collection<T extends { id: string }> {
   }
 }
 
+const COLLECTION_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/
+
 export class Db {
   private collections = new Map<string, Collection<any>>()
   private vectorCollections = new Map<string, VectorCollection<any>>()
@@ -656,6 +662,14 @@ export class Db {
   private collectionConfig: CollectionConfig
   private hooks?: DbHooks
   private logger = getLogger(['coldbase', 'db'])
+
+  private validateCollectionName(name: string): void {
+    if (!name || name.length > 64 || !COLLECTION_NAME_RE.test(name)) {
+      throw new ValidationError(
+        `Invalid collection name "${name}": must be 1-64 characters, start with alphanumeric, and contain only alphanumeric, underscore, or hyphen`
+      )
+    }
+  }
 
   constructor(
     private driver: StorageDriver,
@@ -681,6 +695,7 @@ export class Db {
   collection<T extends { id: string }>(name: string, options?: CollectionOptions): Collection<T> {
     let col = this.collections.get(name)
     if (!col) {
+      this.validateCollectionName(name)
       this.logger.debug('Creating collection instance {name}', { name })
       col = new Collection<T>(
         this.driver,
@@ -700,6 +715,7 @@ export class Db {
   ): VectorCollection<T> {
     let col = this.vectorCollections.get(name)
     if (!col) {
+      this.validateCollectionName(name)
       this.logger.debug('Creating vector collection instance {name}', { name })
       col = new VectorCollection<T>(
         this.driver,
@@ -718,6 +734,7 @@ export class Db {
    * In serverless, call this from a scheduled function rather than inline.
    */
   async compact(name: string): Promise<CompactResult> {
+    this.validateCollectionName(name)
     this.logger.info('Starting DB-level compaction for {name}', { name })
     const bloomConfig = this.collectionConfig.useBloomFilter
       ? { expectedItems: this.collectionConfig.bloomFilterExpectedItems, falsePositiveRate: this.collectionConfig.bloomFilterFalsePositiveRate }
@@ -740,6 +757,7 @@ export class Db {
    * In serverless, call this from a scheduled function.
    */
   async vacuum(name: string): Promise<VacuumResult> {
+    this.validateCollectionName(name)
     this.logger.info('Starting DB-level vacuum for {name}', { name })
     const bloomConfig = this.collectionConfig.useBloomFilter
       ? { expectedItems: this.collectionConfig.bloomFilterExpectedItems, falsePositiveRate: this.collectionConfig.bloomFilterFalsePositiveRate }
@@ -811,10 +829,6 @@ export class Db {
       await fn(tx)
     } catch (error) {
       const compensationErrors: Error[] = []
-
-      // Ensure compensation mutations get a strictly later timestamp
-      // so they sort after the original writes in the WAL
-      await new Promise(resolve => setTimeout(resolve, 1))
 
       for (let i = compensations.length - 1; i >= 0; i--) {
         try {

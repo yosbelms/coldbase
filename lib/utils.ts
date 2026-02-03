@@ -1,4 +1,14 @@
 import { Readable } from 'stream'
+import { getLogger } from '@logtape/logtape'
+
+const logger = getLogger(['coldbase', 'utils'])
+
+let _lastTs = 0
+export function monotonicTimestamp(): number {
+  const now = Date.now()
+  _lastTs = now > _lastTs ? now : _lastTs + 1
+  return _lastTs
+}
 
 export async function streamToString(stream: Readable): Promise<string> {
   const chunks: Buffer[] = []
@@ -24,10 +34,12 @@ export async function* streamLines(stream: Readable): AsyncGenerator<{ line: str
 }
 
 export async function* streamJsonLines<T = unknown>(stream: Readable): AsyncGenerator<T> {
-  for await (const { line } of streamLines(stream)) {
+  for await (const { line, lineNum } of streamLines(stream)) {
     try {
       yield JSON.parse(line)
-    } catch { /* ignore malformed */ }
+    } catch {
+      logger.warn('Malformed JSON at line {lineNum}, skipping', { lineNum })
+    }
   }
 }
 
@@ -223,5 +235,77 @@ export class LRUCache<K, V> {
 
   entries(): IterableIterator<[K, V]> {
     return this.cache.entries()
+  }
+}
+
+/**
+ * Bounded min-heap that keeps only the top-k items.
+ * `compare(a, b)` should return < 0 when `a` is *worse* than `b`
+ * (i.e. `a` should be evicted before `b`).
+ */
+export class TopKHeap<T> {
+  private heap: T[] = []
+
+  constructor(
+    private k: number,
+    private compare: (a: T, b: T) => number
+  ) {}
+
+  push(item: T): void {
+    if (this.heap.length < this.k) {
+      this.heap.push(item)
+      this.bubbleUp(this.heap.length - 1)
+    } else if (this.compare(item, this.heap[0]) > 0) {
+      // item is better than the worst in heap — replace root
+      this.heap[0] = item
+      this.sinkDown(0)
+    }
+  }
+
+  toSortedArray(): T[] {
+    return [...this.heap].sort((a, b) => this.compare(b, a))
+  }
+
+  get size(): number {
+    return this.heap.length
+  }
+
+  private bubbleUp(i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1
+      if (this.compare(this.heap[i], this.heap[parent]) < 0) {
+        this.swap(i, parent)
+        i = parent
+      } else {
+        break
+      }
+    }
+  }
+
+  private sinkDown(i: number): void {
+    const n = this.heap.length
+    while (true) {
+      let smallest = i
+      const left = 2 * i + 1
+      const right = 2 * i + 2
+      if (left < n && this.compare(this.heap[left], this.heap[smallest]) < 0) {
+        smallest = left
+      }
+      if (right < n && this.compare(this.heap[right], this.heap[smallest]) < 0) {
+        smallest = right
+      }
+      if (smallest !== i) {
+        this.swap(i, smallest)
+        i = smallest
+      } else {
+        break
+      }
+    }
+  }
+
+  private swap(i: number, j: number): void {
+    const tmp = this.heap[i]
+    this.heap[i] = this.heap[j]
+    this.heap[j] = tmp
   }
 }

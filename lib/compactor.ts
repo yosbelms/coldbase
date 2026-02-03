@@ -231,7 +231,9 @@ export class CollectionCompactor {
         const [id, data] = JSON.parse(line)
         const deleted = data === null
         index.set(id, { offset: currentOffset, length: lineLength, deleted })
-      } catch { /* ignore malformed */ }
+      } catch {
+        this.logger.warn('Malformed JSON in {collection}.jsonl at offset {offset}, skipping', { collection, offset: currentOffset })
+      }
       currentOffset += lineLength + 1 // +1 for newline character
     }
 
