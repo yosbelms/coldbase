@@ -232,6 +232,7 @@ export class Collection<T extends { id: string }> {
   /**
    * Serverless-friendly automatic maintenance.
    * Uses probabilistic triggers to distribute load across invocations.
+   * Includes retry logic with exponential backoff for transient failures.
    */
   private maybeRunMaintenance(): void {
     const { autoCompact, autoVacuum } = this.config
@@ -241,26 +242,18 @@ export class Collection<T extends { id: string }> {
       this.shouldTriggerMaintenance(autoCompact).then(shouldCompact => {
         if (!shouldCompact) return
 
-        this.compactor.compact(this.name)
-          .then((result) => {
-            this.hooks?.onCompact?.(this.name, result.durationMs, result.mutationsProcessed)
-            this.logger.debug('Auto-compaction completed for {name}', { name: this.name })
-
+        const options = typeof autoCompact === 'object' ? autoCompact : {}
+        this.runAutoCompactWithRetry(options).then((result) => {
+          if (result) {
             // Check if we should vacuum after compaction
             if (autoVacuum && typeof autoVacuum === 'object' && autoVacuum.afterCompactProbability) {
               if (Math.random() < autoVacuum.afterCompactProbability) {
-                this.runAutoVacuum()
+                const vacuumOptions = typeof autoVacuum === 'object' ? autoVacuum : {}
+                this.runAutoVacuumWithRetry(vacuumOptions)
               }
             }
-          })
-          .catch((error) => {
-            if (error instanceof LockActiveError) {
-              this.logger.debug('Auto-compaction skipped for {name} (lock active)', { name: this.name })
-              return
-            }
-            this.logger.warn('Auto-compaction failed for {name}: {error}', { name: this.name, error })
-            this.hooks?.onError?.(error as Error, 'compact')
-          })
+          }
+        })
       })
     }
 
@@ -268,25 +261,116 @@ export class Collection<T extends { id: string }> {
     if (autoVacuum) {
       this.shouldTriggerMaintenance(autoVacuum).then(shouldVacuum => {
         if (!shouldVacuum) return
-        this.runAutoVacuum()
+        const options = typeof autoVacuum === 'object' ? autoVacuum : {}
+        this.runAutoVacuumWithRetry(options)
       })
     }
   }
 
-  private runAutoVacuum(): void {
-    this.compactor.vacuum(this.name)
-      .then((result) => {
+  /**
+   * Run auto-compaction with retry logic.
+   * Returns the result on success, or undefined if all attempts failed.
+   */
+  private async runAutoCompactWithRetry(
+    options: AutoMaintenanceOptions
+  ): Promise<{ durationMs: number; mutationsProcessed: number } | undefined> {
+    const maxRetries = options.maxRetries ?? 2
+    const retryDelayMs = options.retryDelayMs ?? 1000
+    let lastError: Error | undefined
+    let attempts = 0
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      attempts++
+      try {
+        const result = await this.compactor.compact(this.name)
+        this.hooks?.onCompact?.(this.name, result.durationMs, result.mutationsProcessed)
+        this.logger.debug('Auto-compaction completed for {name}', { name: this.name })
+        return result
+      } catch (error) {
+        if (error instanceof LockActiveError) {
+          this.logger.debug('Auto-compaction skipped for {name} (lock active)', { name: this.name })
+          return undefined // Don't retry lock conflicts
+        }
+
+        lastError = error as Error
+        this.logger.warn('Auto-compaction attempt {attempt}/{max} failed for {name}: {error}', {
+          name: this.name,
+          attempt: attempt + 1,
+          max: maxRetries + 1,
+          error
+        })
+
+        if (attempt < maxRetries) {
+          // Exponential backoff with jitter
+          const delay = retryDelayMs * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+    }
+
+    // All retries exhausted - alert via hooks
+    if (lastError) {
+      this.hooks?.onError?.(lastError, 'compact')
+      this.hooks?.onMaintenanceFailure?.(this.name, 'compact', lastError, attempts)
+      this.logger.error('Auto-compaction failed after {attempts} attempts for {name}', {
+        name: this.name,
+        attempts
+      })
+    }
+    return undefined
+  }
+
+  /**
+   * Run auto-vacuum with retry logic.
+   * Returns the result on success, or undefined if all attempts failed.
+   */
+  private async runAutoVacuumWithRetry(
+    options: AutoMaintenanceOptions
+  ): Promise<{ durationMs: number; recordsRemoved: number } | undefined> {
+    const maxRetries = options.maxRetries ?? 2
+    const retryDelayMs = options.retryDelayMs ?? 1000
+    let lastError: Error | undefined
+    let attempts = 0
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      attempts++
+      try {
+        const result = await this.compactor.vacuum(this.name)
         this.hooks?.onVacuum?.(this.name, result.durationMs, result.recordsRemoved)
         this.logger.debug('Auto-vacuum completed for {name}', { name: this.name })
-      })
-      .catch((error) => {
+        return result
+      } catch (error) {
         if (error instanceof LockActiveError) {
           this.logger.debug('Auto-vacuum skipped for {name} (lock active)', { name: this.name })
-          return
+          return undefined // Don't retry lock conflicts
         }
-        this.logger.warn('Auto-vacuum failed for {name}: {error}', { name: this.name, error })
-        this.hooks?.onError?.(error as Error, 'vacuum')
+
+        lastError = error as Error
+        this.logger.warn('Auto-vacuum attempt {attempt}/{max} failed for {name}: {error}', {
+          name: this.name,
+          attempt: attempt + 1,
+          max: maxRetries + 1,
+          error
+        })
+
+        if (attempt < maxRetries) {
+          // Exponential backoff with jitter
+          const delay = retryDelayMs * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+    }
+
+    // All retries exhausted - alert via hooks
+    if (lastError) {
+      this.hooks?.onError?.(lastError, 'vacuum')
+      this.hooks?.onMaintenanceFailure?.(this.name, 'vacuum', lastError, attempts)
+      this.logger.error('Auto-vacuum failed after {attempts} attempts for {name}', {
+        name: this.name,
+        attempts
       })
+    }
+    return undefined
   }
 
   private async shouldTriggerMaintenance(

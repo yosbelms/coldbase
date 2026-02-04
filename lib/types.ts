@@ -54,16 +54,57 @@ export interface DbHooks {
   onCompact?: (collection: string, durationMs: number, mutationCount: number) => void
   onVacuum?: (collection: string, durationMs: number, removedCount: number) => void
   onError?: (error: Error, operation: string) => void
+  /**
+   * Called when auto-maintenance fails after all retry attempts.
+   * Use this to alert on persistent maintenance failures that could lead to
+   * mutation file accumulation in serverless environments.
+   *
+   * @param collection - The collection that failed maintenance
+   * @param operation - 'compact' or 'vacuum'
+   * @param error - The final error after retries
+   * @param attemptsMade - Number of attempts made (including retries)
+   */
+  onMaintenanceFailure?: (collection: string, operation: 'compact' | 'vacuum', error: Error, attemptsMade: number) => void
 }
 
 export interface CompactorConfig {
   copyBufferSize?: number
   parallelism?: number
   deleteChunkSize?: number
-  /** Duration of the lock lease in ms. Lock expires after this time without renewal. */
+  /**
+   * Base duration of the lock lease in ms. Lock expires after this time without renewal.
+   * When adaptiveLease is enabled, this serves as the minimum lease duration.
+   * Default: 30000 (30 seconds)
+   */
   leaseDurationMs?: number
   /** Maximum items to track in LRU cache during vacuum (memory bound) */
   vacuumCacheSize?: number
+
+  /**
+   * Enable adaptive lease duration based on file size and mutation count.
+   * When enabled, lease duration is automatically calculated as:
+   *   leaseDurationMs + (fileSize * leasePerByte) + (mutationCount * leasePerMutation)
+   * Default: true
+   */
+  adaptiveLease?: boolean
+
+  /**
+   * Milliseconds to add per byte of main file size.
+   * Default: 0.00003 (~30ms per MB, ~1.8s per 60MB)
+   */
+  leasePerByte?: number
+
+  /**
+   * Milliseconds to add per mutation file.
+   * Default: 200 (200ms per mutation file)
+   */
+  leasePerMutation?: number
+
+  /**
+   * Maximum lease duration in ms (cap to prevent runaway locks).
+   * Default: 600000 (10 minutes)
+   */
+  maxLeaseDurationMs?: number
 }
 
 /**
@@ -86,6 +127,19 @@ export interface AutoMaintenanceOptions {
    * Helps avoid unnecessary maintenance when there's little work to do.
    */
   mutationThreshold?: number
+
+  /**
+   * Number of retry attempts for failed maintenance operations.
+   * Default: 2 (total 3 attempts including initial)
+   * Set to 0 to disable retries.
+   */
+  maxRetries?: number
+
+  /**
+   * Base delay in ms between retry attempts (uses exponential backoff).
+   * Default: 1000ms
+   */
+  retryDelayMs?: number
 }
 
 /**
@@ -154,13 +208,17 @@ export interface DbOptions extends CompactorConfig {
  */
 export const SERVERLESS_AUTO_COMPACT: Required<AutoMaintenanceOptions> = {
   probability: 0.1,       // 10% chance per write
-  mutationThreshold: 5    // Only compact if >= 5 mutation files
+  mutationThreshold: 5,   // Only compact if >= 5 mutation files
+  maxRetries: 2,          // Retry twice on failure
+  retryDelayMs: 1000      // 1 second base delay
 }
 
 export const SERVERLESS_AUTO_VACUUM: Required<AutoVacuumOptions> = {
   probability: 0.01,           // 1% chance per write
   mutationThreshold: 0,        // No mutation threshold for vacuum
-  afterCompactProbability: 0.1 // 10% chance after compaction
+  afterCompactProbability: 0.1, // 10% chance after compaction
+  maxRetries: 2,               // Retry twice on failure
+  retryDelayMs: 1000           // 1 second base delay
 }
 
 export const DEFAULT_CONFIG: Required<Omit<DbOptions, 'hooks' | 'retryOptions'>> = {
@@ -170,10 +228,15 @@ export const DEFAULT_CONFIG: Required<Omit<DbOptions, 'hooks' | 'retryOptions'>>
   parallelism: 5,
   deleteChunkSize: 100,
   maxMutationSize: 1024 * 1024 * 10, // 10MB
-  leaseDurationMs: 30000, // 30 second lease for serverless
+  leaseDurationMs: 30000, // 30 second base lease for serverless
   vacuumCacheSize: 100000, // Track up to 100k IDs in memory during vacuum
   useIndex: false,
   useBloomFilter: false,
   bloomFilterExpectedItems: 10000,
-  bloomFilterFalsePositiveRate: 0.01
+  bloomFilterFalsePositiveRate: 0.01,
+  // Adaptive lease settings
+  adaptiveLease: true,
+  leasePerByte: 0.00003, // ~30ms per MB, ~1.8s per 60MB
+  leasePerMutation: 200, // 200ms per mutation file
+  maxLeaseDurationMs: 600000 // 10 minute cap
 }

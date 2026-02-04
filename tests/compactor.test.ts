@@ -171,4 +171,73 @@ describe('CollectionCompactor', () => {
     const list = await driver.list(`${collectionName}.mutation.`)
     expect(list.keys.length).toBe(0)
   })
+
+  test('adaptive lease increases duration for larger files', async () => {
+    // Create a main file with some content
+    const largeContent = Array(1000).fill('["id","data",123456789]').join('\n')
+    await driver.put(`${collectionName}.jsonl`, largeContent)
+
+    // Create multiple mutation files
+    for (let i = 0; i < 10; i++) {
+      await driver.put(
+        `${collectionName}.mutation.${Date.now()}-${i}`,
+        JSON.stringify([[`id-${i}`, { val: i }]])
+      )
+    }
+
+    // Create compactor with adaptive lease enabled (default)
+    const adaptiveCompactor = new CollectionCompactor(driver, {
+      adaptiveLease: true,
+      leaseDurationMs: 30000,
+      leasePerByte: 0.00003,
+      leasePerMutation: 200
+    })
+
+    // Compact should succeed (adaptive lease calculated internally)
+    const result = await adaptiveCompactor.compact(collectionName)
+    expect(result.mutationsProcessed).toBe(10)
+
+    // Verify no mutations remain
+    const remaining = await driver.list(`${collectionName}.mutation.`)
+    expect(remaining.keys.length).toBe(0)
+  })
+
+  test('adaptive lease can be disabled for fixed duration', async () => {
+    const fixedCompactor = new CollectionCompactor(driver, {
+      adaptiveLease: false,
+      leaseDurationMs: 5000 // Fixed 5 second lease
+    })
+
+    await driver.put(
+      `${collectionName}.mutation.1`,
+      JSON.stringify([['id-1', { val: 1 }]])
+    )
+
+    // Should work with fixed lease
+    const result = await fixedCompactor.compact(collectionName)
+    expect(result.mutationsProcessed).toBe(1)
+  })
+
+  test('adaptive lease respects maxLeaseDurationMs cap', async () => {
+    // Create a very large file to trigger max cap
+    const hugeContent = Array(100000).fill('["id","data",123456789]').join('\n')
+    await driver.put(`${collectionName}.jsonl`, hugeContent)
+
+    // Create compactor with low max cap
+    const cappedCompactor = new CollectionCompactor(driver, {
+      adaptiveLease: true,
+      leaseDurationMs: 30000,
+      leasePerByte: 1, // Very high to exceed cap
+      maxLeaseDurationMs: 60000 // 1 minute cap
+    })
+
+    await driver.put(
+      `${collectionName}.mutation.1`,
+      JSON.stringify([['id-1', { val: 1 }]])
+    )
+
+    // Should still work (capped at maxLeaseDurationMs)
+    const result = await cappedCompactor.compact(collectionName)
+    expect(result.mutationsProcessed).toBe(1)
+  })
 })

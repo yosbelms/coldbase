@@ -39,7 +39,11 @@ export class CollectionCompactor {
       parallelism: config.parallelism ?? DEFAULT_CONFIG.parallelism,
       deleteChunkSize: config.deleteChunkSize ?? DEFAULT_CONFIG.deleteChunkSize,
       leaseDurationMs: config.leaseDurationMs ?? DEFAULT_CONFIG.leaseDurationMs,
-      vacuumCacheSize: config.vacuumCacheSize ?? DEFAULT_CONFIG.vacuumCacheSize
+      vacuumCacheSize: config.vacuumCacheSize ?? DEFAULT_CONFIG.vacuumCacheSize,
+      adaptiveLease: config.adaptiveLease ?? DEFAULT_CONFIG.adaptiveLease,
+      leasePerByte: config.leasePerByte ?? DEFAULT_CONFIG.leasePerByte,
+      leasePerMutation: config.leasePerMutation ?? DEFAULT_CONFIG.leasePerMutation,
+      maxLeaseDurationMs: config.maxLeaseDurationMs ?? DEFAULT_CONFIG.maxLeaseDurationMs
     }
     this.bloomFilterConfig = bloomFilterConfig
   }
@@ -47,28 +51,79 @@ export class CollectionCompactor {
   /**
    * Create lock metadata with lease-based expiry (no heartbeat needed).
    */
-  private lockMeta(sessionId: string, expiresAt?: number): string {
+  private lockMeta(sessionId: string, leaseDurationMs: number, expiresAt?: number): string {
     return JSON.stringify({
       sessionId,
-      expiresAt: expiresAt ?? (Date.now() + this.config.leaseDurationMs)
+      expiresAt: expiresAt ?? (Date.now() + leaseDurationMs)
     } as LockMeta)
+  }
+
+  /**
+   * Estimate lease duration based on file size and mutation count.
+   * Returns the calculated lease duration in milliseconds.
+   */
+  private async estimateLeaseDuration(collection: string): Promise<number> {
+    if (!this.config.adaptiveLease) {
+      return this.config.leaseDurationMs
+    }
+
+    const mainKey = `${collection}.jsonl`
+
+    // Get file size
+    const fileSize = await this.driver.size(mainKey) ?? 0
+
+    // Count mutation files
+    let mutationCount = 0
+    let token: string | undefined
+    do {
+      const list = await this.driver.list(`${collection}.mutation.`, token)
+      mutationCount += list.keys.length
+      token = list.continuationToken
+    } while (token)
+
+    // Calculate adaptive lease
+    const baseLease = this.config.leaseDurationMs
+    const fileSizeLease = fileSize * this.config.leasePerByte
+    const mutationLease = mutationCount * this.config.leasePerMutation
+
+    const calculatedLease = baseLease + fileSizeLease + mutationLease
+    const finalLease = Math.min(calculatedLease, this.config.maxLeaseDurationMs)
+
+    this.logger.debug(
+      'Adaptive lease for {collection}: base={base}ms + file={fileMs}ms ({fileSize} bytes) + mutations={mutMs}ms ({mutCount} files) = {total}ms',
+      {
+        collection,
+        base: baseLease,
+        fileMs: Math.round(fileSizeLease),
+        fileSize,
+        mutMs: Math.round(mutationLease),
+        mutCount: mutationCount,
+        total: Math.round(finalLease)
+      }
+    )
+
+    return finalLease
   }
 
   /**
    * Lease-based locking - simpler and more serverless-friendly than heartbeat.
    * Lock automatically expires after leaseDurationMs without needing background timers.
    */
-  private async withLock<T>(collection: string, fn: () => Promise<T>): Promise<T> {
+  private async withLock<T>(collection: string, leaseDurationMs: number, fn: () => Promise<T>): Promise<T> {
     const lockKey = `${collection}.lock`
     const sessionId = randomUUID()
 
     let lockEtag: string | undefined
 
-    this.logger.debug('Acquiring lock {lockKey} for session {sessionId}', { lockKey, sessionId })
+    this.logger.debug('Acquiring lock {lockKey} for session {sessionId} with lease {lease}ms', {
+      lockKey,
+      sessionId,
+      lease: Math.round(leaseDurationMs)
+    })
 
     const acquireLock = async (): Promise<string> => {
       try {
-        return await this.driver.putIfNoneMatch(lockKey, this.lockMeta(sessionId))
+        return await this.driver.putIfNoneMatch(lockKey, this.lockMeta(sessionId, leaseDurationMs))
       } catch (err) {
         if (!(err instanceof PreconditionFailedError)) throw err
 
@@ -76,14 +131,14 @@ export class CollectionCompactor {
         const existing = await this.driver.get(lockKey)
         if (!existing) {
           // Lock was deleted between our attempt and check, retry
-          return await this.driver.putIfNoneMatch(lockKey, this.lockMeta(sessionId))
+          return await this.driver.putIfNoneMatch(lockKey, this.lockMeta(sessionId, leaseDurationMs))
         }
 
         const meta: LockMeta = JSON.parse((await streamToString(existing.stream)) || '{}')
 
         if (meta.expiresAt !== undefined && Date.now() > meta.expiresAt) {
           this.logger.warn('Taking over expired lock {lockKey}', { lockKey })
-          return await this.driver.putIfMatch(lockKey, this.lockMeta(sessionId), existing.etag)
+          return await this.driver.putIfMatch(lockKey, this.lockMeta(sessionId, leaseDurationMs), existing.etag)
         }
         throw new LockActiveError(lockKey)
       }
@@ -93,7 +148,7 @@ export class CollectionCompactor {
       if (!lockEtag) return
       try {
         // Set expiresAt to 0 to immediately invalidate the lock
-        await this.driver.putIfMatch(lockKey, this.lockMeta(sessionId, 0), lockEtag)
+        await this.driver.putIfMatch(lockKey, this.lockMeta(sessionId, leaseDurationMs, 0), lockEtag)
         this.logger.debug('Released lock {lockKey}', { lockKey })
       } catch {
         this.logger.warn('Failed to release lock {lockKey}', { lockKey })
@@ -114,7 +169,10 @@ export class CollectionCompactor {
     let bloomFilterBuilt = false
     let indexBuilt = false
 
-    await this.withLock(collection, async () => {
+    // Estimate lease duration before acquiring lock
+    const leaseDurationMs = await this.estimateLeaseDuration(collection)
+
+    await this.withLock(collection, leaseDurationMs, async () => {
       this.logger.debug('Compacting {collection}', { collection })
       const mainKey = `${collection}.jsonl`
       let workDone: boolean
@@ -280,7 +338,12 @@ export class CollectionCompactor {
     const startTime = Date.now()
     let removedCount = 0
 
-    await this.withLock(collection, async () => {
+    // Estimate lease duration before acquiring lock
+    // Vacuum does 2 passes, so we multiply by 2 for safety
+    const baseLease = await this.estimateLeaseDuration(collection)
+    const leaseDurationMs = Math.min(baseLease * 2, this.config.maxLeaseDurationMs)
+
+    await this.withLock(collection, leaseDurationMs, async () => {
       const mainKey = `${collection}.jsonl`
 
       // Check if main file exists first (use size() to avoid reading entire file)

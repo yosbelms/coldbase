@@ -469,3 +469,74 @@ describe('Transaction', () => {
     expect(await logs.get('log-1')).toBeUndefined()
   })
 })
+
+describe('Auto-maintenance with retry', () => {
+  let tmpDir: string
+  let driver: FileSystemDriver
+
+  beforeEach(async () => {
+    tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'coldbase-maintenance-'))
+    driver = new FileSystemDriver(tmpDir)
+  })
+
+  afterEach(async () => {
+    await fs.promises.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('onMaintenanceFailure hook is called after retries exhausted', async () => {
+    const failures: { collection: string; operation: string; attempts: number }[] = []
+
+    // Create a driver wrapper that fails on compact operations
+    const failingDriver = {
+      ...driver,
+      list: async (prefix: string, token?: string) => {
+        // Return mutation files to trigger compaction work
+        if (prefix.includes('.mutation.')) {
+          return { keys: ['test.mutation.123-abc'], continuationToken: undefined }
+        }
+        return driver.list(prefix, token)
+      },
+      get: async (key: string) => {
+        // Fail when trying to read mutation files during compaction
+        if (key.includes('.mutation.')) {
+          throw new Error('Simulated storage failure')
+        }
+        return driver.get(key)
+      },
+      put: driver.put.bind(driver),
+      delete: driver.delete.bind(driver),
+      size: driver.size.bind(driver),
+      append: driver.append.bind(driver),
+      putIfNoneMatch: driver.putIfNoneMatch.bind(driver),
+      putIfMatch: driver.putIfMatch.bind(driver)
+    }
+
+    const db = new Db(failingDriver as any, {
+      autoCompact: {
+        probability: 1,  // Always trigger
+        mutationThreshold: 0,
+        maxRetries: 1,   // Only 1 retry (2 total attempts)
+        retryDelayMs: 10 // Fast retries for test
+      },
+      hooks: {
+        onMaintenanceFailure: (collection, operation, error, attempts) => {
+          failures.push({ collection, operation, attempts })
+        }
+      }
+    })
+
+    const col = db.collection<{ id: string }>('test')
+
+    // Trigger a write which should trigger auto-compaction
+    await col.put({ id: '1' })
+
+    // Wait for async maintenance to complete
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    // Should have recorded the failure after retries
+    expect(failures.length).toBe(1)
+    expect(failures[0].collection).toBe('test')
+    expect(failures[0].operation).toBe('compact')
+    expect(failures[0].attempts).toBe(2) // Initial + 1 retry
+  })
+})

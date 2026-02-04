@@ -11,13 +11,13 @@ A lightweight, serverless-first write-ahead log (WAL) database for cloud storage
 - **Query API**: `find()` with filtering, pagination, and function predicates
 - **TTL Support**: Auto-expire records based on a timestamp field
 - **Batch Operations**: `getMany()` for efficient multi-key lookups, `batch()` for coalescing writes
-- **Transactions**: Cross-collection atomicity via saga pattern with automatic compensation on failure
+- **Transactions**: Cross-collection consistency via saga pattern with best-effort compensation on failure (not ACID - see Limitations)
 - **Parallel Processing**: Configurable parallelism for mutation processing
 - **Retry Logic**: Exponential backoff with jitter for transient failures
 - **Hooks & Metrics**: Monitor writes, compactions, and errors
 - **Size Limits**: Configurable mutation size limits
 - **Multiple Storage Backends**: S3, Azure Blob, or local filesystem
-- **Performance Optimizations**: Bloom filter, in-memory index, lease-based locking
+- **Performance Optimizations**: Bloom filter, in-memory index, adaptive lease-based locking
 
 ## Installation
 
@@ -127,6 +127,34 @@ export async function maintenanceHandler() {
 }
 ```
 
+### Handling Maintenance Failures
+
+In serverless environments, failed maintenance can lead to mutation file accumulation over time. Coldbase provides retry logic and alerting hooks to handle this:
+
+```typescript
+const db = new Db(new S3Driver('my-bucket', 'us-east-1'), {
+  autoCompact: {
+    probability: 0.1,
+    mutationThreshold: 5,
+    maxRetries: 3,        // Retry up to 3 times on failure
+    retryDelayMs: 2000    // Start with 2s delay (exponential backoff)
+  },
+  hooks: {
+    // Called when maintenance fails after all retry attempts
+    onMaintenanceFailure: (collection, operation, error, attempts) => {
+      // Send alert to monitoring system
+      console.error(`ALERT: ${operation} failed for ${collection} after ${attempts} attempts:`, error)
+      // Example: Send to CloudWatch, Datadog, PagerDuty, etc.
+    }
+  }
+})
+```
+
+**Best practices for serverless:**
+- Always configure `onMaintenanceFailure` to alert on persistent failures
+- Use a separate scheduled function as a fallback for guaranteed maintenance
+- Monitor mutation file count via `collection.countMutationFiles()`
+
 ## API Reference
 
 ### `Db`
@@ -143,7 +171,11 @@ interface DbOptions {
   autoVacuum?: boolean | AutoVacuumOptions        // (default: false)
 
   // Lock configuration
-  leaseDurationMs?: number     // Lock lease duration (default: 30000)
+  leaseDurationMs?: number     // Base lock lease duration (default: 30000)
+  adaptiveLease?: boolean      // Auto-calculate lease from file size (default: true)
+  leasePerByte?: number        // Ms per byte of file size (default: 0.00003)
+  leasePerMutation?: number    // Ms per mutation file (default: 200)
+  maxLeaseDurationMs?: number  // Maximum lease cap (default: 600000)
 
   // Processing
   copyBufferSize?: number      // Buffer size for file operations (default: 65536)
@@ -170,6 +202,8 @@ interface DbOptions {
 interface AutoMaintenanceOptions {
   probability?: number         // Chance (0-1) to trigger per write
   mutationThreshold?: number   // Min pending mutations before triggering
+  maxRetries?: number          // Retry attempts on failure (default: 2)
+  retryDelayMs?: number        // Base delay between retries (default: 1000)
 }
 
 interface AutoVacuumOptions extends AutoMaintenanceOptions {
@@ -181,6 +215,8 @@ interface DbHooks {
   onCompact?: (collection: string, durationMs: number, mutationCount: number) => void
   onVacuum?: (collection: string, durationMs: number, removedCount: number) => void
   onError?: (error: Error, operation: string) => void
+  // Called when auto-maintenance fails after all retries - use for alerting
+  onMaintenanceFailure?: (collection: string, operation: 'compact' | 'vacuum', error: Error, attempts: number) => void
 }
 
 interface MaintenanceSchedule {
@@ -194,8 +230,13 @@ interface MaintenanceSchedule {
 ```typescript
 import { SERVERLESS_AUTO_COMPACT, SERVERLESS_AUTO_VACUUM } from 'coldbase'
 
-// SERVERLESS_AUTO_COMPACT = { probability: 0.1, mutationThreshold: 5 }
-// SERVERLESS_AUTO_VACUUM = { probability: 0.01, mutationThreshold: 0, afterCompactProbability: 0.1 }
+// SERVERLESS_AUTO_COMPACT = {
+//   probability: 0.1, mutationThreshold: 5, maxRetries: 2, retryDelayMs: 1000
+// }
+// SERVERLESS_AUTO_VACUUM = {
+//   probability: 0.01, mutationThreshold: 0, afterCompactProbability: 0.1,
+//   maxRetries: 2, retryDelayMs: 1000
+// }
 ```
 
 **Methods:**
@@ -220,7 +261,8 @@ await collection.put({ id: 'id1', ...fields })
 // Delete
 await collection.delete('id1')
 
-// Batch writes (coalesces into single mutation file for better performance)
+// Batch writes - ATOMIC within a single collection (all-or-nothing)
+// Writes to a single mutation file, so either all succeed or none do
 await collection.batch(tx => {
   tx.put({ id: 'id1', name: 'Alice' })
   tx.put({ id: 'id2', name: 'Bob' })
@@ -293,17 +335,28 @@ The maintenance task automatically handles `LockActiveError` by silently skippin
 
 ### Transactions
 
-Cross-collection atomicity using the saga pattern. Each write tracks a compensation action; if any step fails, compensations run in reverse order to undo previous writes.
+Cross-collection consistency using the saga pattern. Each write tracks a compensation action; if any step fails, compensations run in reverse order to undo previous writes.
+
+> **⚠️ Important: Cross-Collection Transactions Are Not ACID**
+>
+> Coldbase transactions provide **best-effort consistency**, not true ACID guarantees:
+> - **No Isolation**: Each write is immediately visible to concurrent readers. Other processes can read partial transaction state.
+> - **No Atomicity**: If a transaction fails mid-way, earlier writes are already persisted. Compensation attempts to undo them but may also fail.
+> - **Compensation is Best-Effort**: If compensation fails, errors are collected and reported, but the original writes remain.
+>
+> Use transactions when eventual consistency is acceptable and you need a convenient way to group related writes with automatic rollback attempts.
+>
+> **For single-collection atomic writes, use `batch()` instead** - it writes all operations to one mutation file, providing true atomicity within that collection.
 
 ```typescript
 await db.transaction(async (tx) => {
   const users = tx.collection<User>('users')
   const logs = tx.collection<Log>('logs')
 
-  await users.put({ id: '1', name: 'Alice' })
+  await users.put({ id: '1', name: 'Alice' })  // Immediately visible to other readers!
   await logs.put({ id: 'log-1', action: 'user-created' })
 })
-// If logs.put fails → users.put is compensated (deleted)
+// If logs.put fails → compensation attempts to delete users.put
 ```
 
 The transactional collection supports `put`, `delete`, and `get` (read-only, no tracking). On failure, a `TransactionError` is thrown containing the original error and any compensation errors:
@@ -316,21 +369,21 @@ try {
 } catch (e) {
   if (e instanceof TransactionError) {
     console.log(e.originalError)        // The error that caused the rollback
-    console.log(e.compensationErrors)   // Any errors during compensation
+    console.log(e.compensationErrors)   // Any errors during compensation (may be non-empty!)
   }
 }
 ```
 
 **Nested Transactions (Savepoints):**
 
-Transactions can be nested via `tx.transaction()`. A nested transaction acts as a savepoint — if it fails, only its own writes are rolled back while the outer transaction continues. If it succeeds, its compensations are promoted to the parent so they roll back if a later outer step fails.
+Transactions can be nested via `tx.transaction()`. A nested transaction acts as a savepoint — if it fails, only its own writes are compensated while the outer transaction continues. If it succeeds, its compensations are promoted to the parent so they run if a later outer step fails.
 
 ```typescript
 await db.transaction(async (tx) => {
   const users = tx.collection<User>('users')
   await users.put({ id: '1', name: 'Alice' })
 
-  // Nested transaction: if this fails, only inner writes are rolled back
+  // Nested transaction: if this fails, only inner writes are compensated
   try {
     await tx.transaction(async (inner) => {
       const logs = inner.collection<Log>('logs')
@@ -338,7 +391,7 @@ await db.transaction(async (tx) => {
       throw new Error('inner failure')
     })
   } catch {
-    // Inner rolled back, outer continues — users.put still committed
+    // Inner compensated, outer continues — users.put still committed
   }
 })
 ```
@@ -454,6 +507,13 @@ const driver = new FileSystemDriver('./data')
 ```typescript
 import { S3Driver } from 'coldbase'
 const driver = new S3Driver('my-bucket', 'us-east-1')
+
+// With custom endpoint (e.g., MinIO, LocalStack, or S3-compatible storage)
+const customDriver = new S3Driver('my-bucket', 'us-east-1', {
+  endpoint: 'http://localhost:9000',
+  credentials: { accessKeyId: 'minioadmin', secretAccessKey: 'minioadmin' },
+  forcePathStyle: true
+})
 ```
 
 ### Azure Blob
@@ -472,7 +532,8 @@ import {
   ValidationError,
   SizeLimitError,
   VectorDimensionError,
-  InvalidVectorError
+  InvalidVectorError,
+  TransactionError
 } from 'coldbase'
 
 try {
@@ -538,21 +599,25 @@ Vector collections use the same storage format as regular collections:
 
 ### Compaction Path
 
-1. Acquire distributed lock (lease-based, 30s default - no background heartbeat needed)
-2. List and read mutation files in parallel
-3. Append to main `.jsonl` file
-4. Delete processed mutations in chunks
-5. Rebuild index and bloom filter (if enabled)
-6. Release lock
+1. Calculate adaptive lease duration based on file size and mutation count
+2. Acquire distributed lock (lease-based, no background heartbeat needed)
+3. List and read mutation files in parallel
+4. Append to main `.jsonl` file
+5. Delete processed mutations in chunks
+6. Rebuild index and bloom filter (if enabled)
+7. Release lock
 
 ### Vacuum Path (Single-Pass with LRU Cache)
 
-1. **Pass 1**: Stream file, track last occurrence of each ID in LRU cache (bounded memory)
+1. Calculate adaptive lease duration (2× compaction estimate for two-pass algorithm)
+2. Acquire distributed lock
+3. **Pass 1**: Stream file, track last occurrence of each ID in LRU cache (bounded memory)
    - IDs that overflow the cache are added to an "overflow" set
-2. **Pass 2**: Write surviving records to temp file:
+4. **Pass 2**: Write surviving records to temp file:
    - For tracked IDs: only keep the last occurrence (if not deleted)
    - For overflow IDs: keep all non-deleted records
-3. **Swap**: Replace main file, rebuild index and bloom filter
+5. **Swap**: Replace main file, rebuild index and bloom filter
+6. Release lock
 
 ## Performance Tips
 
@@ -582,6 +647,63 @@ Vector collections use the same storage format as regular collections:
 - **Read Performance**: Falls back to full scan when mutations are pending or index disabled
 - **Eventual Consistency**: Data is durable immediately but appears in main file after compaction
 - **Memory**: Vacuum uses LRU cache (default 100k IDs); overflow IDs aren't fully deduplicated
-- **Saga-Based Transactions**: Cross-collection transactions use best-effort compensation (not true ACID); compensation failures are reported but cannot guarantee rollback
+- **Cross-Collection Transactions Are Not ACID**:
+  - **No Isolation**: Writes are immediately visible to concurrent readers mid-transaction
+  - **No Atomicity**: Failed transactions leave earlier writes persisted; compensation is best-effort
+  - **No Phantom Protection**: Concurrent transactions may see inconsistent reads
+  - Use only when eventual consistency is acceptable
+- **Single-Collection Atomicity**: `batch()` within one collection IS atomic (all-or-nothing) since it writes to a single mutation file. Use `batch()` when you need atomic writes within a collection.
 - **Bloom Filter False Positives**: ~1% false positive rate by default (configurable)
 - **Vector Search**: Uses brute-force search (O(n)); suitable for 10k-100k vectors, not millions
+- **Lease Duration**: Adaptive lease is enabled by default to handle varying file sizes. For extremely large files (>1GB) or very slow storage, you may need to tune `leasePerByte` or increase `maxLeaseDurationMs`.
+
+## Adaptive Lease Duration
+
+By default, Coldbase automatically calculates lock lease duration based on file size and mutation count. This prevents lease expiration during large operations without requiring manual tuning.
+
+**How it works:**
+```
+leaseDuration = baseLease + (fileSize × leasePerByte) + (mutationCount × leasePerMutation)
+```
+
+**Default values:**
+- `leaseDurationMs`: 30,000ms (30s base)
+- `leasePerByte`: 0.00003ms (~30ms per MB)
+- `leasePerMutation`: 200ms per mutation file
+- `maxLeaseDurationMs`: 600,000ms (10 minute cap)
+
+**Example calculations:**
+- Empty collection: 30s (base only)
+- 10MB file + 5 mutations: 30s + 300ms + 1s = ~31.3s
+- 100MB file + 50 mutations: 30s + 3s + 10s = ~43s
+- 1GB file + 100 mutations: 30s + 30s + 20s = ~80s
+
+**Customizing adaptive lease:**
+```typescript
+const db = new Db(driver, {
+  // Disable adaptive lease (use fixed duration)
+  adaptiveLease: false,
+  leaseDurationMs: 60000,
+
+  // Or customize the adaptive parameters
+  adaptiveLease: true,
+  leaseDurationMs: 30000,      // Base lease
+  leasePerByte: 0.00005,       // More time per byte for slow storage
+  leasePerMutation: 300,       // More time per mutation
+  maxLeaseDurationMs: 300000   // 5 minute cap
+})
+```
+
+**Monitoring lease usage:**
+```typescript
+const db = new Db(driver, {
+  hooks: {
+    onCompact: (collection, durationMs) => {
+      // Log actual duration vs estimated lease
+      console.log(`Compaction took ${durationMs}ms`)
+    }
+  }
+})
+```
+
+The adaptive lease is calculated **before** acquiring the lock, so the estimation adds minimal overhead.

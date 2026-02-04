@@ -355,6 +355,166 @@ describe('VectorCollection', () => {
       expect(results).toHaveLength(1)
       expect(results[0].id).toBe('b')
     })
+
+    test('returns empty array for empty collection', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      const results = await embeddings.search([1, 0, 0])
+      expect(results).toHaveLength(0)
+    })
+
+    test('returns empty array when no results match filter', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[]; category: string }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0], category: 'fruit' })
+
+      const results = await embeddings.search([1, 0, 0], { filter: { category: 'vegetable' } })
+      expect(results).toHaveLength(0)
+    })
+
+    test('returns empty array when no results match threshold', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'cosine'
+      })
+
+      await embeddings.put({ id: 'a', vector: [0, 1, 0] }) // orthogonal to query
+
+      const results = await embeddings.search([1, 0, 0], { threshold: 0.9 })
+      expect(results).toHaveLength(0)
+    })
+
+    test('applies euclidean threshold as max distance', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'euclidean',
+        normalize: false
+      })
+
+      await embeddings.batch(tx => {
+        tx.put({ id: 'close', vector: [0.5, 0, 0] })   // distance 0.5
+        tx.put({ id: 'far', vector: [10, 0, 0] })      // distance 10
+      })
+
+      const results = await embeddings.search([0, 0, 0], { threshold: 1 })
+
+      expect(results).toHaveLength(1)
+      expect(results[0].id).toBe('close')
+    })
+
+    test('applies dotProduct threshold as min score', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'dotProduct',
+        normalize: false
+      })
+
+      await embeddings.batch(tx => {
+        tx.put({ id: 'high', vector: [2, 0, 0] })   // dot product 2
+        tx.put({ id: 'low', vector: [0.1, 0, 0] }) // dot product 0.1
+      })
+
+      const results = await embeddings.search([1, 0, 0], { threshold: 1 })
+
+      expect(results).toHaveLength(1)
+      expect(results[0].id).toBe('high')
+    })
+
+    test('handles updates to existing vectors', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[]; text: string }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0], text: 'original' })
+      await embeddings.put({ id: 'a', vector: [0, 1, 0], text: 'updated' }) // Update vector
+
+      const results = await embeddings.search([0, 1, 0], { limit: 1 })
+
+      expect(results).toHaveLength(1)
+      expect(results[0].id).toBe('a')
+      expect(results[0].data.text).toBe('updated')
+      expect(results[0].score).toBeCloseTo(1) // Should match the updated vector
+    })
+
+    test('handles all documents deleted', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'b', vector: [0, 1, 0] })
+      await embeddings.delete('a')
+      await embeddings.delete('b')
+
+      const results = await embeddings.search([1, 0, 0])
+      expect(results).toHaveLength(0)
+    })
+
+    test('validates query vector for NaN', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await expect(embeddings.search([1, NaN, 0])).rejects.toThrow(InvalidVectorError)
+    })
+
+    test('validates query vector for Infinity', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await expect(embeddings.search([1, Infinity, 0])).rejects.toThrow(InvalidVectorError)
+    })
+
+    test('respects normalize=false for cosine metric', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'cosine',
+        normalize: false
+      })
+
+      // Insert non-normalized vector
+      await embeddings.put({ id: 'a', vector: [3, 4, 0] })
+
+      const doc = await embeddings.get('a')
+      // Vector should NOT be normalized (magnitude should be 5, not 1)
+      expect(doc?.vector[0]).toBe(3)
+      expect(doc?.vector[1]).toBe(4)
+    })
+
+    test('normalizes vectors by default for cosine metric', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'cosine'
+        // normalize defaults to true for cosine
+      })
+
+      await embeddings.put({ id: 'a', vector: [3, 4, 0] })
+
+      const doc = await embeddings.get('a')
+      // Vector should be normalized (magnitude should be 1)
+      expect(doc?.vector[0]).toBeCloseTo(0.6)
+      expect(doc?.vector[1]).toBeCloseTo(0.8)
+    })
+
+    test('does not normalize by default for euclidean metric', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3,
+        metric: 'euclidean'
+        // normalize defaults to false for euclidean
+      })
+
+      await embeddings.put({ id: 'a', vector: [3, 4, 0] })
+
+      const doc = await embeddings.get('a')
+      // Vector should NOT be normalized
+      expect(doc?.vector[0]).toBe(3)
+      expect(doc?.vector[1]).toBe(4)
+    })
   })
 
   describe('find', () => {
@@ -441,6 +601,177 @@ describe('VectorCollection', () => {
       // Data should still be accessible
       const results = await embeddings.search([1, 0, 0], { limit: 2 })
       expect(results).toHaveLength(2)
+    })
+
+    test('vacuum removes deleted and duplicate records', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      // Create records, update one, delete another
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'b', vector: [0, 1, 0] })
+      await embeddings.put({ id: 'a', vector: [0.5, 0.5, 0] }) // Update 'a'
+      await embeddings.delete('b') // Delete 'b'
+
+      await embeddings.compact()
+      const result = await embeddings.vacuum()
+
+      expect(result.recordsRemoved).toBeGreaterThan(0)
+
+      // Only 'a' should remain with updated vector
+      const count = await embeddings.count()
+      expect(count).toBe(1)
+
+      const doc = await embeddings.get('a')
+      expect(doc?.vector[0]).toBeCloseTo(0.5 / Math.sqrt(0.5))
+    })
+  })
+
+  describe('get', () => {
+    test('returns undefined for non-existent key', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      const result = await embeddings.get('nonexistent')
+      expect(result).toBeUndefined()
+    })
+
+    test('returns undefined for deleted key', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.delete('a')
+
+      const result = await embeddings.get('a')
+      expect(result).toBeUndefined()
+    })
+
+    test('returns latest version after update', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[]; version: number }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0], version: 1 })
+      await embeddings.put({ id: 'a', vector: [0, 1, 0], version: 2 })
+
+      const result = await embeddings.get('a')
+      expect(result?.version).toBe(2)
+    })
+  })
+
+  describe('count', () => {
+    test('returns 0 for empty collection', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      const count = await embeddings.count()
+      expect(count).toBe(0)
+    })
+
+    test('excludes deleted records', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'b', vector: [0, 1, 0] })
+      await embeddings.delete('a')
+
+      const count = await embeddings.count()
+      expect(count).toBe(1)
+    })
+
+    test('counts unique records after updates', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'a', vector: [0, 1, 0] }) // Update
+      await embeddings.put({ id: 'a', vector: [0, 0, 1] }) // Update again
+
+      const count = await embeddings.count()
+      expect(count).toBe(1)
+    })
+  })
+
+  describe('deleteExpired', () => {
+    test('deletes expired records and returns count', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[]; expiresAt: number }>('embeddings', {
+        dimension: 3,
+        ttlField: 'expiresAt'
+      })
+
+      const past = Date.now() - 1000
+      const future = Date.now() + 100000
+
+      await embeddings.batch(tx => {
+        tx.put({ id: 'expired1', vector: [1, 0, 0], expiresAt: past })
+        tx.put({ id: 'expired2', vector: [0, 1, 0], expiresAt: past })
+        tx.put({ id: 'valid', vector: [0, 0, 1], expiresAt: future })
+      })
+
+      const deletedCount = await embeddings.deleteExpired()
+
+      expect(deletedCount).toBe(2)
+
+      const count = await embeddings.count()
+      expect(count).toBe(1)
+    })
+
+    test('returns 0 when no ttlField configured', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+        // No ttlField
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+
+      const deletedCount = await embeddings.deleteExpired()
+      expect(deletedCount).toBe(0)
+    })
+  })
+
+  describe('read', () => {
+    test('streams all records including mutations', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'b', vector: [0, 1, 0] })
+
+      const records: { id: string }[] = []
+      for await (const record of embeddings.read()) {
+        records.push({ id: record.id })
+      }
+
+      expect(records).toHaveLength(2)
+    })
+  })
+
+  describe('countMutationFiles', () => {
+    test('counts pending mutation files', async () => {
+      const embeddings = db.vectorCollection<{ id: string; vector: number[] }>('embeddings', {
+        dimension: 3
+      })
+
+      await embeddings.put({ id: 'a', vector: [1, 0, 0] })
+      await embeddings.put({ id: 'b', vector: [0, 1, 0] })
+      await embeddings.put({ id: 'c', vector: [0, 0, 1] })
+
+      const count = await embeddings.countMutationFiles()
+      expect(count).toBe(3)
+
+      await embeddings.compact()
+
+      const countAfter = await embeddings.countMutationFiles()
+      expect(countAfter).toBe(0)
     })
   })
 })

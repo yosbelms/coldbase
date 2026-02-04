@@ -40,9 +40,19 @@ export class S3Driver implements StorageDriver {
 
   constructor(
     private bucket: string,
-    region = 'us-east-1'
+    region = 'us-east-1',
+    options?: {
+      endpoint?: string
+      credentials?: { accessKeyId: string; secretAccessKey: string }
+      forcePathStyle?: boolean
+    }
   ) {
-    this.client = new S3Client({ region })
+    this.client = new S3Client({
+      region,
+      endpoint: options?.endpoint,
+      credentials: options?.credentials,
+      forcePathStyle: options?.forcePathStyle
+    })
   }
 
   /**
