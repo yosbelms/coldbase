@@ -11,7 +11,7 @@ interface AzureError extends Error {
 }
 
 const isNotFound = (e: AzureError) => e.statusCode === 404 || e.code === 'BlobNotFound'
-const isPreconditionFailed = (e: AzureError) => e.statusCode === 412
+const isPreconditionFailed = (e: AzureError) => e.statusCode === 412 || e.statusCode === 409
 
 export class AzureBlobDriver implements StorageDriver {
   private container: ContainerClient
