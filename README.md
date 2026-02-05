@@ -298,7 +298,7 @@ Supported value types:
 
 ### Custom Query Function
 
-For advanced queries, provide a custom query handler. It runs **after** basic filters:
+For advanced queries, provide a custom query handler. It runs **after** basic filters and pagination:
 
 ```
 Request: GET /data/users?role=admin&q=sort(.name)
@@ -306,8 +306,8 @@ Request: GET /data/users?role=admin&q=sort(.name)
 Flow:
 1. Fetch all docs
 2. Apply basic filters (?role=admin)
-3. Apply custom query (?q=sort(.name))
-4. Apply pagination (?limit, ?offset)
+3. Apply pagination (?limit, ?offset)
+4. Apply custom query (?q=sort(.name))
 ```
 
 ```typescript
