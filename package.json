@@ -1,6 +1,6 @@
 {
   "name": "coldbase",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "main": "lib/index.js",
   "scripts": {
     "test": "jest",
