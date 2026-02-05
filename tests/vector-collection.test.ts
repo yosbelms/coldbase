@@ -1,17 +1,17 @@
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { Db } from '../lib/db'
-import { VectorCollection } from '../lib/vector-collection'
 import { FileSystemDriver } from '../lib/drivers/fs'
-import { VectorDimensionError, InvalidVectorError } from '../lib/errors'
+import { InvalidVectorError, VectorDimensionError } from '../lib/errors'
+import { VectorCollection } from '../lib/vector-collection'
 import {
   cosineSimilarity,
-  euclideanDistance,
   dotProduct,
+  euclideanDistance,
   normalizeVector,
   validateVector
 } from '../lib/vector-utils'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
 
 describe('Vector Utils', () => {
   describe('dotProduct', () => {

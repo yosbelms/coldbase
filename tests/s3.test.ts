@@ -1,11 +1,11 @@
+import { CreateBucketCommand, S3Client } from '@aws-sdk/client-s3'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import S3rver from 's3rver'
+import { Readable } from 'stream'
 import { S3Driver } from '../lib/drivers/s3'
 import { PreconditionFailedError } from '../lib/errors'
-import { S3Client, CreateBucketCommand } from '@aws-sdk/client-s3'
-import S3rver from 's3rver'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
-import { Readable } from 'stream'
 
 const streamToString = (stream: Readable): Promise<string> => {
   const chunks: Buffer[] = []

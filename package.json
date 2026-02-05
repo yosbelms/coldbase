@@ -1,6 +1,6 @@
 {
   "name": "coldbase",
-  "version": "1.5.1",
+  "version": "1.6.1",
   "main": "lib/index.js",
   "scripts": {
     "test": "jest",
@@ -18,15 +18,20 @@
     "azure",
     "blob",
     "cold-storage",
-    "cloud"
+    "cloud",
+    "serverless",
+    "rest-api",
+    "hono"
   ],
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.966.0",
     "@azure/storage-blob": "^12.29.1",
+    "@hono/swagger-ui": "^0.5.0",
     "@types/jest": "^30.0.0",
     "@types/node": "^25.0.3",
     "@types/s3rver": "^3.7.4",
     "azurite": "^3.34.0",
+    "hono": "^4.7.0",
     "jest": "^30.2.0",
     "s3rver": "^3.7.1",
     "ts-jest": "^29.4.6",
@@ -38,6 +43,14 @@
   },
   "peerDependencies": {
     "@aws-sdk/client-s3": "^3.966.0",
-    "@azure/storage-blob": "^12.29.1"
+    "@azure/storage-blob": "^12.29.1",
+    "@hono/swagger-ui": "^0.5.0",
+    "hono": "^4.7.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": { "optional": true },
+    "@azure/storage-blob": { "optional": true },
+    "hono": { "optional": true },
+    "@hono/swagger-ui": { "optional": true }
   }
 }

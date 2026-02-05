@@ -1,9 +1,9 @@
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import { Readable } from 'stream'
 import { FileSystemDriver } from '../lib/drivers/fs'
 import { PreconditionFailedError } from '../lib/errors'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
-import { Readable } from 'stream'
 
 const streamToString = (stream: Readable): Promise<string> => {
   const chunks: any[] = []

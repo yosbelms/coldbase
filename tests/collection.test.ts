@@ -1,10 +1,10 @@
-import { Db, Collection } from '../lib/db'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import { Collection, Db } from '../lib/db'
 import { FileSystemDriver } from '../lib/drivers/fs'
 import { TransactionError } from '../lib/errors'
 import { streamToString } from '../lib/utils'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
 
 describe('Db', () => {
   let tmpDir: string

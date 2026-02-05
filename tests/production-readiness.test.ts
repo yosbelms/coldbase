@@ -1,10 +1,10 @@
-import { monotonicTimestamp, TopKHeap } from '../lib/utils'  // internal, not part of public API
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { Db } from '../lib/db'
 import { FileSystemDriver } from '../lib/drivers/fs'
 import { ValidationError } from '../lib/errors'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
+import { monotonicTimestamp, TopKHeap } from '../lib/utils'; // internal, not part of public API
 
 describe('monotonicTimestamp', () => {
   test('returns strictly increasing values', () => {

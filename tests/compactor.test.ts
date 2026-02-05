@@ -1,11 +1,11 @@
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { CollectionCompactor } from '../lib/compactor'
-import { FileSystemDriver } from '../lib/drivers/fs'
 import { Db } from '../lib/db'
+import { FileSystemDriver } from '../lib/drivers/fs'
 import { LockActiveError } from '../lib/errors'
 import { streamToString } from '../lib/utils'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
 
 describe('CollectionCompactor', () => {
   let tmpDir: string

@@ -1,7 +1,7 @@
-import { Db, Collection } from '../lib/db'
-import { FileSystemDriver } from '../lib/drivers/fs'
 import * as fs from 'fs'
 import * as path from 'path'
+import { Db } from '../lib/db'
+import { FileSystemDriver } from '../lib/drivers/fs'
 
 interface TestRecord {
   id: string

@@ -1,7 +1,9 @@
 import { AzureBlobDriver } from '../lib/drivers/azure'
 import { PreconditionFailedError } from '../lib/errors'
 import { BlobServiceClient } from '@azure/storage-blob'
+// @ts-ignore - azurite has no type declarations
 import BlobServer from 'azurite/dist/src/blob/BlobServer'
+// @ts-ignore - azurite has no type declarations
 import BlobConfiguration from 'azurite/dist/src/blob/BlobConfiguration'
 import * as fs from 'fs'
 import * as path from 'path'

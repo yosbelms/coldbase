@@ -4,6 +4,150 @@ A lightweight, serverless-first write-ahead log (WAL) database for cloud storage
 
 **5-40x cheaper than DynamoDB or Cosmos DB.** By leveraging S3/Azure Blob's low-cost API pricing ($0.40 per million reads vs $250 for DynamoDB), Coldbase dramatically reduces database costs for serverless applications. A medium-traffic app costs ~$30/month vs $500+ with traditional serverless databases. [See full comparison →](./COMPARISON.md)
 
+## Table of Contents
+
+- [Examples](#examples)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [HTTP API](#http-api)
+- [Logging](#logging)
+- [Serverless Usage](#serverless-usage)
+- [API Reference](#api-reference)
+  - [Db](#db)
+  - [Collection](#collectiont)
+  - [Transactions](#transactions)
+  - [VectorCollection](#vectorcollectiont)
+- [Storage Drivers](#storage-drivers)
+- [Error Handling](#error-handling)
+- [Architecture](#architecture)
+- [Performance Tips](#performance-tips)
+- [Limitations](#limitations)
+- [Adaptive Lease Duration](#adaptive-lease-duration)
+
+## Examples
+
+### Simple Database (Todo App)
+
+```typescript
+import { Db, FileSystemDriver } from 'coldbase'
+
+interface Todo {
+  id: string
+  title: string
+  completed: boolean
+  createdAt: number
+}
+
+const db = new Db(new FileSystemDriver('./data'))
+const todos = db.collection<Todo>('todos')
+
+// Create
+await todos.put({
+  id: crypto.randomUUID(),
+  title: 'Learn Coldbase',
+  completed: false,
+  createdAt: Date.now()
+})
+
+// List incomplete todos
+const pending = await todos.find({
+  where: { completed: false }
+})
+
+// Mark as done
+await todos.put({ ...pending[0], completed: true })
+
+// Delete
+await todos.delete(pending[0].id)
+```
+
+### Vector Database (Semantic Search)
+
+```typescript
+import { Db, FileSystemDriver } from 'coldbase'
+
+interface Document {
+  id: string
+  vector: number[]
+  title: string
+  content: string
+}
+
+const db = new Db(new FileSystemDriver('./data'))
+const docs = db.vectorCollection<Document>('documents', {
+  dimension: 384,  // e.g., all-MiniLM-L6-v2 embeddings
+  metric: 'cosine'
+})
+
+// Index documents with embeddings
+await docs.put({
+  id: 'doc1',
+  vector: await embed('Introduction to machine learning'),
+  title: 'ML Basics',
+  content: 'Machine learning is a subset of AI...'
+})
+
+await docs.put({
+  id: 'doc2',
+  vector: await embed('Deep neural networks explained'),
+  title: 'Deep Learning',
+  content: 'Neural networks with multiple layers...'
+})
+
+// Semantic search
+const query = await embed('How do neural networks work?')
+const results = await docs.search(query, { limit: 5 })
+
+for (const { id, score, data } of results) {
+  console.log(`${data.title} (score: ${score.toFixed(3)})`)
+}
+
+// Helper: generate embeddings (use your preferred provider)
+async function embed(text: string): Promise<number[]> {
+  // OpenAI, Cohere, HuggingFace, or local model
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text
+  })
+  return response.data[0].embedding
+}
+```
+
+### HTTP Server (REST API)
+
+```typescript
+import { Db, FileSystemDriver } from 'coldbase'
+import { createHttpApi } from 'coldbase/http'
+import { serve } from '@hono/node-server'
+
+const db = new Db(new FileSystemDriver('./data'))
+
+const app = createHttpApi(db, {
+  auth: {
+    keys: [
+      { key: process.env.API_KEY!, role: 'admin' }
+    ]
+  },
+  maxPageSize: 100,
+  maxBodySize: 1024 * 1024  // 1MB
+})
+
+// Add custom routes
+app.get('/health', (c) => c.json({ status: 'ok' }))
+
+serve({ fetch: app.fetch, port: 3000 })
+console.log('Server running at http://localhost:3000')
+
+// API Usage:
+// GET    /data/users              - List users
+// GET    /data/users/123          - Get user by ID
+// PUT    /data/users/123          - Create/update user
+// DELETE /data/users/123          - Delete user
+// POST   /data/embeddings/search  - Vector search
+// GET    /docs                    - Swagger UI
+```
+
 ## Features
 
 - **Serverless-First**: Stateless operations, no in-memory state between invocations
@@ -62,9 +206,166 @@ const admins = await users.find({ where: { role: 'admin' } })
 await users.delete('u1')
 ```
 
+## HTTP API
+
+Coldbase includes an optional HTTP module built on [Hono](https://hono.dev/) for exposing your database via REST API.
+
+### Installation
+
+```bash
+npm install hono @hono/swagger-ui
+```
+
+### Quick Start
+
+```typescript
+import { Db, FileSystemDriver } from 'coldbase'
+import { createHttpApi } from 'coldbase/http'
+
+const db = new Db(new FileSystemDriver('./data'))
+const app = createHttpApi(db)
+
+// Serve with your preferred runtime
+export default app  // Cloudflare Workers / Bun
+// or: serve(app)   // Node.js with @hono/node-server
+```
+
+### Routes
+
+| Route | Method | Role | Description |
+|-------|--------|------|-------------|
+| `/data/:collection` | GET | reader | List/query documents |
+| `/data/:collection/:id` | GET | reader | Get document |
+| `/data/:collection/:id` | PUT | editor | Create/update document |
+| `/data/:collection/:id` | DELETE | editor | Delete document |
+| `/data/:collection/search` | POST | reader | Vector similarity search |
+| `/data/tx` | POST | editor | Execute transaction |
+| `/admin/collections` | GET | admin | List collections |
+| `/admin/:collection/stats` | GET | admin | Collection statistics |
+| `/admin/:collection/compact` | POST | admin | Trigger compaction |
+| `/admin/:collection/vacuum` | POST | admin | Trigger vacuum |
+| `/docs` | GET | - | Swagger UI |
+| `/docs/openapi.json` | GET | - | OpenAPI spec |
+
+### Authentication
+
+API keys are loaded from environment variables by default:
+
+```bash
+COLDBASE_READER_KEY=xxx  # Read-only access
+COLDBASE_EDITOR_KEY=xxx  # Read + write access
+COLDBASE_ADMIN_KEY=xxx   # Full access including /admin and /docs
+```
+
+```typescript
+// With explicit keys
+const app = createHttpApi(db, {
+  auth: {
+    keys: [
+      { key: 'my-reader-key', role: 'reader' },
+      { key: 'my-editor-key', role: 'editor' },
+      { key: 'my-admin-key', role: 'admin' }
+    ],
+    useEnv: false  // Don't load from env
+  }
+})
+
+// Client usage
+fetch('/data/users', {
+  headers: { 'Authorization': 'Bearer my-reader-key' }
+})
+```
+
+If no keys are configured, authentication is disabled (open access).
+
+### Query Parameters
+
+**Basic filtering** - Use any query param as `prop=value` filter:
+
+```
+GET /data/users?role=admin&active=true&limit=20&offset=0
+```
+
+Supported value types:
+- Strings: `?role=admin`
+- Booleans: `?active=true` or `?active=false`
+- Numbers: `?score=100`
+
+**Reserved params** (not used for filtering):
+- `limit`, `offset` - Pagination
+- `prefix` - Filter by ID prefix
+- `query`, `q` - Custom query string
+
+### Custom Query Function
+
+For advanced queries, provide a custom query handler. It runs **after** basic filters:
+
+```
+Request: GET /data/users?role=admin&q=sort(.name)
+
+Flow:
+1. Fetch all docs
+2. Apply basic filters (?role=admin)
+3. Apply custom query (?q=sort(.name))
+4. Apply pagination (?limit, ?offset)
+```
+
+```typescript
+// Using jsonquery
+import { jsonquery } from '@jsonquerylang/jsonquery'
+
+const app = createHttpApi(db, {
+  query: (docs, q) => jsonquery(docs, q)
+})
+
+// Client: GET /data/users?active=true&q=sort(.name) | pick(.name, .email)
+```
+
+```typescript
+// Using sift (MongoDB-style queries in q param)
+import sift from 'sift'
+
+const app = createHttpApi(db, {
+  query: (docs, q) => docs.filter(sift(JSON.parse(q)))
+})
+
+// Client: GET /data/users?role=admin&q={"age":{"$gt":25}}
+```
+
+### Configurable Limits
+
+```typescript
+const app = createHttpApi(db, {
+  maxPageSize: 200,        // Max docs per page (default: 100)
+  defaultPageSize: 50,     // Default docs per page (default: 20)
+  maxBodySize: 5 * 1024 * 1024,  // Max request body (default: 1MB)
+  maxTxOperations: 100,    // Max ops per transaction (default: 50)
+  maxVectorResults: 200    // Max vector search results (default: 100)
+})
+```
+
+### Extending the API
+
+Since `createHttpApi` returns a Hono app, extend it naturally:
+
+```typescript
+const app = createHttpApi(db)
+
+// Add custom routes
+app.get('/api/reports/active-users', async (c) => {
+  const users = db.collection('users')
+  const active = await users.find({ where: u => u.active })
+  return c.json({ count: active.length })
+})
+
+// Add middleware
+import { cors } from 'hono/cors'
+app.use('*', cors())
+```
+
 ## Logging
 
-Coldbase uses [LogTape](https://github.com/doodadjs/logtape) for logging. You can configure it to see internal operations:
+Coldbase uses [LogTape](https://github.com/dahlia/logtape) for logging. Configure it to see internal operations:
 
 ```typescript
 import { configure, getConsoleSink } from '@logtape/logtape'
@@ -77,6 +378,18 @@ await configure({
   ]
 })
 ```
+
+**Log categories:**
+- `coldbase.db` - Database operations
+- `coldbase.collection` - Collection operations
+- `coldbase.compactor` - Compaction and vacuum
+- `coldbase.http` - HTTP API requests (method, path, status, duration)
+- `coldbase.driver.fs` / `s3` / `azure` - Storage driver operations
+
+**HTTP request logging** is automatic when using the HTTP API. Requests are logged at appropriate levels:
+- `info` - Successful requests (2xx, 3xx)
+- `warn` - Client errors (4xx)
+- `error` - Server errors (5xx)
 
 ## Serverless Usage
 
