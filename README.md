@@ -1,5 +1,7 @@
 # Coldbase
 
+**Currently in Beta**
+
 A lightweight, serverless-first write-ahead log (WAL) database for cloud storage. Supports AWS S3, Azure Blob Storage, and local filesystem. Designed for stateless environments where each operation reads directly from storage.
 
 **5-40x cheaper than DynamoDB or Cosmos DB.** By leveraging S3/Azure Blob's low-cost API pricing ($0.40 per million reads vs $250 for DynamoDB), Coldbase dramatically reduces database costs for serverless applications. A medium-traffic app costs ~$30/month vs $500+ with traditional serverless databases. [See full comparison →](./COMPARISON.md)
