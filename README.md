@@ -2,7 +2,7 @@
 
 **Currently in Beta**
 
-A lightweight, serverless-first write-ahead log (WAL) database for cloud storage. Supports AWS S3, Azure Blob Storage, and local filesystem. Designed for stateless environments where each operation reads directly from storage.
+A lightweight, serverless-first write-ahead log (WAL) database for cloud storage. Supports AWS S3, Azure Blob Storage, Google Cloud Storage, and local filesystem. Designed for stateless environments where each operation reads directly from storage.
 
 **5-40x cheaper than DynamoDB or Cosmos DB.** By leveraging S3/Azure Blob's low-cost API pricing ($0.40 per million reads vs $250 for DynamoDB), Coldbase dramatically reduces database costs for serverless applications. A medium-traffic app costs ~$30/month vs $500+ with traditional serverless databases. [See full comparison →](./COMPARISON.md)
 
@@ -164,7 +164,7 @@ console.log('Server running at http://localhost:3000')
 - **Retry Logic**: Exponential backoff with jitter for transient failures
 - **Hooks & Metrics**: Monitor writes, compactions, and errors
 - **Size Limits**: Configurable mutation size limits
-- **Multiple Storage Backends**: S3, Azure Blob, or local filesystem
+- **Multiple Storage Backends**: S3, Azure Blob, GCS, or local filesystem
 - **Performance Optimizations**: Bloom filter, in-memory index, adaptive lease-based locking
 
 ## Installation
@@ -177,6 +177,7 @@ For cloud storage, install the appropriate SDK:
 ```bash
 npm install @aws-sdk/client-s3        # For S3
 npm install @azure/storage-blob       # For Azure
+npm install @google-cloud/storage     # For GCS
 ```
 
 ## Quick Start
@@ -386,7 +387,7 @@ await configure({
 - `coldbase.collection` - Collection operations
 - `coldbase.compactor` - Compaction and vacuum
 - `coldbase.http` - HTTP API requests (method, path, status, duration)
-- `coldbase.driver.fs` / `s3` / `azure` - Storage driver operations
+- `coldbase.driver.fs` / `s3` / `azure` / `gcs` - Storage driver operations
 
 **HTTP request logging** is automatic when using the HTTP API. Requests are logged at appropriate levels:
 - `info` - Successful requests (2xx, 3xx)
@@ -838,6 +839,34 @@ const customDriver = new S3Driver('my-bucket', 'us-east-1', {
 import { AzureBlobDriver } from 'coldbase'
 const driver = new AzureBlobDriver(connectionString, 'my-container')
 ```
+
+### Google Cloud Storage
+```typescript
+import { GCSDriver } from 'coldbase'
+
+// Uses Application Default Credentials (ADC) automatically
+const driver = new GCSDriver('my-bucket')
+
+// With explicit credentials
+const driver = new GCSDriver('my-bucket', {
+  projectId: 'my-gcp-project',
+  keyFilename: '/path/to/service-account.json'
+})
+
+// With credentials object (e.g. from environment)
+const driver = new GCSDriver('my-bucket', {
+  projectId: process.env.GCP_PROJECT_ID,
+  credentials: JSON.parse(process.env.GCP_CREDENTIALS!)
+})
+
+// With custom endpoint (e.g. fake-gcs-server emulator for local dev/testing)
+const driver = new GCSDriver('my-bucket', {
+  projectId: 'test-project',
+  apiEndpoint: 'http://localhost:4443'
+})
+```
+
+> **Note:** The GCS driver uses GCS [object generations](https://cloud.google.com/storage/docs/object-versioning) as ETags for conditional writes (`putIfNoneMatch`, `putIfMatch`). This provides optimistic concurrency control. Bucket versioning does **not** need to be enabled.
 
 ## Error Handling
 

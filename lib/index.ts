@@ -3,6 +3,7 @@ export { StorageDriver, ListResult } from './drivers/interface'
 export { S3Driver } from './drivers/s3'
 export { FileSystemDriver } from './drivers/fs'
 export { AzureBlobDriver } from './drivers/azure'
+export { GCSDriver } from './drivers/gcs'
 
 // Core
 export { Db, Collection, DbOptions, TransactionalCollection, TransactionContext } from './db'
