@@ -229,67 +229,128 @@ export class VectorCollection<T extends VectorDocument> {
     this.invalidateCache()
 
     this.hooks?.onWrite?.(this.name, items.length)
-    this.maybeRunMaintenance()
+    await this.maybeRunMaintenance()
   }
 
   /**
    * Serverless-friendly automatic maintenance.
    * Uses probabilistic triggers to distribute load across invocations.
+   * Includes retry logic with exponential backoff for transient failures.
+   * Awaited so maintenance completes before the write returns (critical for serverless).
    */
-  private maybeRunMaintenance(): void {
+  private async maybeRunMaintenance(): Promise<void> {
     const { autoCompact, autoVacuum } = this.config
 
-    // Determine if we should attempt compaction
     if (autoCompact) {
-      this.shouldTriggerMaintenance(autoCompact).then(shouldCompact => {
-        if (!shouldCompact) return
+      const shouldCompact = await this.shouldTriggerMaintenance(autoCompact)
+      if (shouldCompact) {
+        const options = typeof autoCompact === 'object' ? autoCompact : {}
+        const result = await this.runAutoCompactWithRetry(options)
 
-        this.compactor.compact(this.name)
-          .then((result) => {
-            this.hooks?.onCompact?.(this.name, result.durationMs, result.mutationsProcessed)
-            this.logger.debug('Auto-compaction completed for {name}', { name: this.name })
-
-            // Check if we should vacuum after compaction
-            if (autoVacuum && typeof autoVacuum === 'object' && autoVacuum.afterCompactProbability) {
-              if (Math.random() < autoVacuum.afterCompactProbability) {
-                this.runAutoVacuum()
-              }
-            }
-          })
-          .catch((error) => {
-            if (error instanceof LockActiveError) {
-              this.logger.debug('Auto-compaction skipped for {name} (lock active)', { name: this.name })
-              return
-            }
-            this.logger.warn('Auto-compaction failed for {name}: {error}', { name: this.name, error })
-            this.hooks?.onError?.(error as Error, 'compact')
-          })
-      })
+        if (result && autoVacuum && typeof autoVacuum === 'object' && autoVacuum.afterCompactProbability) {
+          if (Math.random() < autoVacuum.afterCompactProbability) {
+            const vacuumOptions = typeof autoVacuum === 'object' ? autoVacuum : {}
+            await this.runAutoVacuumWithRetry(vacuumOptions)
+          }
+        }
+      }
     }
 
-    // Determine if we should attempt vacuum (independent of compaction)
     if (autoVacuum) {
-      this.shouldTriggerMaintenance(autoVacuum).then(shouldVacuum => {
-        if (!shouldVacuum) return
-        this.runAutoVacuum()
-      })
+      const shouldVacuum = await this.shouldTriggerMaintenance(autoVacuum)
+      if (shouldVacuum) {
+        const options = typeof autoVacuum === 'object' ? autoVacuum : {}
+        await this.runAutoVacuumWithRetry(options)
+      }
     }
   }
 
-  private runAutoVacuum(): void {
-    this.compactor.vacuum(this.name)
-      .then((result) => {
+  private async runAutoCompactWithRetry(
+    options: AutoMaintenanceOptions
+  ): Promise<{ durationMs: number; mutationsProcessed: number } | undefined> {
+    const maxRetries = options.maxRetries ?? 2
+    const retryDelayMs = options.retryDelayMs ?? 1000
+    let lastError: Error | undefined
+    let attempts = 0
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      attempts++
+      try {
+        const result = await this.compactor.compact(this.name)
+        this.hooks?.onCompact?.(this.name, result.durationMs, result.mutationsProcessed)
+        this.logger.debug('Auto-compaction completed for {name}', { name: this.name })
+        return result
+      } catch (error) {
+        if (error instanceof LockActiveError) {
+          this.logger.debug('Auto-compaction skipped for {name} (lock active)', { name: this.name })
+          return undefined
+        }
+
+        lastError = error as Error
+        this.logger.warn('Auto-compaction attempt {attempt}/{max} failed for {name}: {error}', {
+          name: this.name,
+          attempt: attempt + 1,
+          max: maxRetries + 1,
+          error
+        })
+
+        if (attempt < maxRetries) {
+          const delay = retryDelayMs * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+    }
+
+    if (lastError) {
+      this.hooks?.onError?.(lastError, 'compact')
+      this.hooks?.onMaintenanceFailure?.(this.name, 'compact', lastError, attempts)
+      this.logger.error('Auto-compaction failed after {attempts} attempts for {name}', { name: this.name, attempts })
+    }
+    return undefined
+  }
+
+  private async runAutoVacuumWithRetry(
+    options: AutoMaintenanceOptions
+  ): Promise<{ durationMs: number; recordsRemoved: number } | undefined> {
+    const maxRetries = options.maxRetries ?? 2
+    const retryDelayMs = options.retryDelayMs ?? 1000
+    let lastError: Error | undefined
+    let attempts = 0
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      attempts++
+      try {
+        const result = await this.compactor.vacuum(this.name)
         this.hooks?.onVacuum?.(this.name, result.durationMs, result.recordsRemoved)
         this.logger.debug('Auto-vacuum completed for {name}', { name: this.name })
-      })
-      .catch((error) => {
+        return result
+      } catch (error) {
         if (error instanceof LockActiveError) {
           this.logger.debug('Auto-vacuum skipped for {name} (lock active)', { name: this.name })
-          return
+          return undefined
         }
-        this.logger.warn('Auto-vacuum failed for {name}: {error}', { name: this.name, error })
-        this.hooks?.onError?.(error as Error, 'vacuum')
-      })
+
+        lastError = error as Error
+        this.logger.warn('Auto-vacuum attempt {attempt}/{max} failed for {name}: {error}', {
+          name: this.name,
+          attempt: attempt + 1,
+          max: maxRetries + 1,
+          error
+        })
+
+        if (attempt < maxRetries) {
+          const delay = retryDelayMs * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+    }
+
+    if (lastError) {
+      this.hooks?.onError?.(lastError, 'vacuum')
+      this.hooks?.onMaintenanceFailure?.(this.name, 'vacuum', lastError, attempts)
+      this.logger.error('Auto-vacuum failed after {attempts} attempts for {name}', { name: this.name, attempts })
+    }
+    return undefined
   }
 
   private async shouldTriggerMaintenance(

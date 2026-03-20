@@ -208,44 +208,42 @@ export class Collection<T extends { id: string }> {
     this.invalidateCache()
 
     this.hooks?.onWrite?.(this.name, items.length)
-    this.maybeRunMaintenance()
+    await this.maybeRunMaintenance()
   }
 
   /**
    * Serverless-friendly automatic maintenance.
    * Uses probabilistic triggers to distribute load across invocations.
    * Includes retry logic with exponential backoff for transient failures.
+   * Awaited so maintenance completes before the write returns (critical for serverless).
    */
-  private maybeRunMaintenance(): void {
+  private async maybeRunMaintenance(): Promise<void> {
     const { autoCompact, autoVacuum } = this.config
 
     // Determine if we should attempt compaction
     if (autoCompact) {
-      this.shouldTriggerMaintenance(autoCompact).then(shouldCompact => {
-        if (!shouldCompact) return
-
+      const shouldCompact = await this.shouldTriggerMaintenance(autoCompact)
+      if (shouldCompact) {
         const options = typeof autoCompact === 'object' ? autoCompact : {}
-        this.runAutoCompactWithRetry(options).then((result) => {
-          if (result) {
-            // Check if we should vacuum after compaction
-            if (autoVacuum && typeof autoVacuum === 'object' && autoVacuum.afterCompactProbability) {
-              if (Math.random() < autoVacuum.afterCompactProbability) {
-                const vacuumOptions = typeof autoVacuum === 'object' ? autoVacuum : {}
-                this.runAutoVacuumWithRetry(vacuumOptions)
-              }
-            }
+        const result = await this.runAutoCompactWithRetry(options)
+
+        // Check if we should vacuum after compaction
+        if (result && autoVacuum && typeof autoVacuum === 'object' && autoVacuum.afterCompactProbability) {
+          if (Math.random() < autoVacuum.afterCompactProbability) {
+            const vacuumOptions = typeof autoVacuum === 'object' ? autoVacuum : {}
+            await this.runAutoVacuumWithRetry(vacuumOptions)
           }
-        })
-      })
+        }
+      }
     }
 
     // Determine if we should attempt vacuum (independent of compaction)
     if (autoVacuum) {
-      this.shouldTriggerMaintenance(autoVacuum).then(shouldVacuum => {
-        if (!shouldVacuum) return
+      const shouldVacuum = await this.shouldTriggerMaintenance(autoVacuum)
+      if (shouldVacuum) {
         const options = typeof autoVacuum === 'object' ? autoVacuum : {}
-        this.runAutoVacuumWithRetry(options)
-      })
+        await this.runAutoVacuumWithRetry(options)
+      }
     }
   }
 
@@ -583,6 +581,7 @@ export class Collection<T extends { id: string }> {
         try {
           return JSON.parse(await streamToString(mutResp.stream)) as MutationBatch
         } catch {
+          this.logger.warn('Malformed mutation file {key}, skipping', { key })
           return null
         }
       })

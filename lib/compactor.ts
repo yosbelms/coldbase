@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { getLogger } from '@logtape/logtape'
 import { StorageDriver } from './drivers/interface'
 import { streamToString, streamLines, parallelLimit, chunk, BloomFilter, LRUCache } from './utils'
-import { LockActiveError, PreconditionFailedError } from './errors'
+import { LockActiveError, LockAcquisitionError, PreconditionFailedError } from './errors'
 import { CompactorConfig, DEFAULT_CONFIG } from './types'
 
 export { CompactorConfig }
@@ -125,7 +125,7 @@ export class CollectionCompactor {
       try {
         return await this.driver.putIfNoneMatch(lockKey, this.lockMeta(sessionId, leaseDurationMs))
       } catch (err) {
-        if (!(err instanceof PreconditionFailedError)) throw err
+        if (!(err instanceof PreconditionFailedError)) throw new LockAcquisitionError(collection, err as Error)
 
         // Check if existing lock has expired
         const existing = await this.driver.get(lockKey)
@@ -390,7 +390,7 @@ export class CollectionCompactor {
 
           tracker.set(id, { lineNum, deleted: data === null })
         } catch {
-          /* ignore malformed */
+          this.logger.warn('Malformed JSON in {collection}.jsonl at line {line}, skipping', { collection, line: lineNum })
         }
       }
 
@@ -443,7 +443,7 @@ export class CollectionCompactor {
             }
           }
         } catch {
-          /* ignore malformed */
+          this.logger.warn('Malformed JSON in {collection}.jsonl at line {line}, skipping', { collection, line: lineNum })
         }
       }
       await flush()
