@@ -11,7 +11,6 @@ export interface CompactResult {
   mutationsProcessed: number
   durationMs: number
   bloomFilterBuilt?: boolean
-  indexBuilt?: boolean
 }
 
 export interface VacuumResult {
@@ -167,7 +166,6 @@ export class CollectionCompactor {
     const startTime = Date.now()
     let totalMutations = 0
     let bloomFilterBuilt = false
-    let indexBuilt = false
 
     // Estimate lease duration before acquiring lock
     const leaseDurationMs = await this.estimateLeaseDuration(collection)
@@ -246,79 +244,50 @@ export class CollectionCompactor {
         }
       } while (workDone)
 
-      // Build bloom filter and index in single pass after compaction
-      const buildResult = await this.buildBloomFilterAndIndex(collection)
-      bloomFilterBuilt = buildResult.bloomBuilt
-      indexBuilt = buildResult.indexBuilt
+      // Build bloom filter in single pass after compaction
+      bloomFilterBuilt = await this.buildBloomFilter(collection)
     })
 
     return {
       mutationsProcessed: totalMutations,
       durationMs: Date.now() - startTime,
-      bloomFilterBuilt,
-      indexBuilt
+      bloomFilterBuilt
     }
   }
 
   /**
-   * Build both bloom filter and index in a single pass through the file.
-   * This is more efficient than building them separately.
+   * Build bloom filter in a single pass through the main file.
+   * Returns true if a bloom filter was built, false if not configured.
    */
-  private async buildBloomFilterAndIndex(collection: string): Promise<{ bloomBuilt: boolean; indexBuilt: boolean }> {
+  private async buildBloomFilter(collection: string): Promise<boolean> {
+    if (!this.bloomFilterConfig) return false
+
     const mainKey = `${collection}.jsonl`
     const bloomKey = `${collection}.bloom`
-    const indexKey = `${collection}.idx`
 
     const mainResp = await this.driver.get(mainKey)
-    if (!mainResp) return { bloomBuilt: false, indexBuilt: false }
+    if (!mainResp) return false
 
-    // Track index entries: id -> { offset, length, deleted }
-    const index = new Map<string, { offset: number; length: number; deleted: boolean }>()
-    let currentOffset = 0
+    // Track the last state of each ID (may be deleted)
+    const states = new Map<string, boolean>() // id -> deleted
 
-    // Build bloom filter if configured
-    const filter = this.bloomFilterConfig
-      ? new BloomFilter(this.bloomFilterConfig.expectedItems, this.bloomFilterConfig.falsePositiveRate)
-      : null
-
-    // Single pass through the file
-    // Note: We use character lengths (not byte lengths) because db.ts uses substring()
     for await (const { line } of streamLines(mainResp.stream)) {
-      const lineLength = line.length // character count for substring()
       try {
         const [id, data] = JSON.parse(line)
-        const deleted = data === null
-        index.set(id, { offset: currentOffset, length: lineLength, deleted })
+        states.set(id, data === null)
       } catch {
-        this.logger.warn('Malformed JSON in {collection}.jsonl at offset {offset}, skipping', { collection, offset: currentOffset })
-      }
-      currentOffset += lineLength + 1 // +1 for newline character
-    }
-
-    // Build final index and bloom filter from tracked data
-    const indexData: Record<string, { o: number; l: number }> = {}
-    for (const [id, { offset, length, deleted }] of index) {
-      if (!deleted) {
-        indexData[id] = { o: offset, l: length }
-        if (filter) {
-          filter.add(id)
-        }
+        this.logger.warn('Malformed JSON in {collection}.jsonl, skipping', { collection })
       }
     }
 
-    // Write both files
-    await this.driver.put(indexKey, JSON.stringify(indexData))
-    this.logger.debug('Built index for {collection} with {count} entries', {
-      collection,
-      count: Object.keys(indexData).length
-    })
-
-    if (filter) {
-      await this.driver.put(bloomKey, filter.serialize())
-      this.logger.debug('Built bloom filter for {collection}', { collection })
+    const filter = new BloomFilter(this.bloomFilterConfig.expectedItems, this.bloomFilterConfig.falsePositiveRate)
+    for (const [id, deleted] of states) {
+      if (!deleted) filter.add(id)
     }
 
-    return { bloomBuilt: !!filter, indexBuilt: true }
+    await this.driver.put(bloomKey, filter.serialize())
+    this.logger.debug('Built bloom filter for {collection}', { collection })
+    return true
   }
 
   /**
@@ -472,8 +441,8 @@ export class CollectionCompactor {
         await this.driver.delete([tempKey])
       }
 
-      // Rebuild bloom filter and index in single pass after vacuum
-      await this.buildBloomFilterAndIndex(collection)
+      // Rebuild bloom filter in single pass after vacuum
+      await this.buildBloomFilter(collection)
     })
 
     return {

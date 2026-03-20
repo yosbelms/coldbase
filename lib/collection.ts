@@ -14,12 +14,6 @@ import {
   CollectionOptions
 } from './types'
 
-/** Index entry mapping ID to byte offset and length in main file */
-interface IndexEntry {
-  o: number // offset
-  l: number // length
-}
-
 /** Transaction interface for batching multiple writes */
 export interface BatchTransaction<T extends { id: string }> {
   put(data: T): void
@@ -42,7 +36,6 @@ export interface CollectionConfig {
   autoCompact: boolean | AutoMaintenanceOptions
   autoVacuum: boolean | AutoVacuumOptions
   compactorConfig: CompactorConfig
-  useIndex: boolean
   useBloomFilter: boolean
   bloomFilterExpectedItems: number
   bloomFilterFalsePositiveRate: number
@@ -58,11 +51,8 @@ export class Collection<T extends { id: string }> {
   private compactor: CollectionCompactor
   private logger = getLogger(['coldbase', 'collection'])
 
-  // Cached index and bloom filter (lazily loaded)
-  private cachedIndex?: Record<string, IndexEntry>
+  // Cached bloom filter (lazily loaded)
   private cachedBloomFilter?: BloomFilter
-  private cachedMainFileContent?: string
-  private indexValid = false
   private bloomFilterValid = false
 
   constructor(
@@ -82,41 +72,11 @@ export class Collection<T extends { id: string }> {
   }
 
   /**
-   * Invalidate cached index, bloom filter, and file content.
-   * Called after writes since pending mutations make them stale.
+   * Invalidate cached bloom filter.
+   * Called after writes since pending mutations make it stale.
    */
   private invalidateCache(): void {
-    this.indexValid = false
     this.bloomFilterValid = false
-    this.cachedMainFileContent = undefined
-  }
-
-  /**
-   * Load the index from storage if enabled and valid.
-   * Index is only valid when there are no pending mutations.
-   */
-  private async loadIndex(): Promise<Record<string, IndexEntry> | undefined> {
-    if (!this.config.useIndex) return undefined
-    if (this.indexValid && this.cachedIndex) return this.cachedIndex
-
-    // Check if there are pending mutations - if so, index is stale
-    const mutations = await this.driver.list(`${this.name}.mutation.`)
-    if (mutations.keys.length > 0) {
-      this.indexValid = false
-      return undefined
-    }
-
-    try {
-      const resp = await this.driver.get(`${this.name}.idx`)
-      if (!resp) return undefined
-
-      const content = await streamToString(resp.stream)
-      this.cachedIndex = JSON.parse(content)
-      this.indexValid = true
-      return this.cachedIndex
-    } catch {
-      return undefined
-    }
   }
 
   /**
@@ -398,70 +358,43 @@ export class Collection<T extends { id: string }> {
   /**
    * Get a single record by ID.
    *
-   * Performance optimizations:
-   * - If bloom filter is enabled and says ID doesn't exist, returns immediately
-   * - If index is enabled and no pending mutations, uses direct byte offset lookup
-   * - Otherwise falls back to full scan
+   * If bloom filter is enabled and says ID doesn't exist, returns immediately.
+   * Otherwise falls back to full scan (main file + all mutations).
    */
   async get(id: string, options: { at?: number } = {}): Promise<T | undefined> {
+    const startTime = Date.now()
+    const mutationCount = this.hooks?.onRead ? await this.countMutationFiles() : 0
+
     this.logger.debug('Getting item {id} from {name}', { id, name: this.name })
 
-    // Fast path: Check bloom filter first (only if not doing time travel)
     if (!options.at) {
+      // Bloom filter: fast rejection for IDs that definitely don't exist
       const bloom = await this.loadBloomFilter()
       if (bloom && !bloom.mightContain(id)) {
         this.logger.debug('Bloom filter: {id} definitely not in {name}', { id, name: this.name })
+        this.hooks?.onRead?.(this.name, Date.now() - startTime, 0)
         return undefined
       }
     }
 
-    // Fast path: Use index for direct lookup (only if not doing time travel)
-    if (!options.at) {
-      const index = await this.loadIndex()
-      if (index) {
-        const entry = index[id]
-        if (!entry) {
-          this.logger.debug('Index: {id} not found in {name}', { id, name: this.name })
-          return undefined
-        }
-
-        // Use cached file content or load it once
-        if (!this.cachedMainFileContent) {
-          const resp = await this.driver.get(`${this.name}.jsonl`)
-          if (resp) {
-            this.cachedMainFileContent = await streamToString(resp.stream)
-          }
-        }
-
-        if (this.cachedMainFileContent) {
-          const line = this.cachedMainFileContent.substring(entry.o, entry.o + entry.l)
-          try {
-            const [, data] = JSON.parse(line)
-            if (data !== null && !this.isExpired(data)) {
-              return data as T
-            }
-          } catch {
-            // Fall through to full scan
-          }
-        }
-      }
-    }
-
-    // Slow path: Full scan
+    // Full scan: main file + all mutations
     let result: T | null | undefined
-
     for await (const record of this.read({ at: options.at })) {
       if (record.id === id) {
         result = record.data
       }
     }
 
-    if (result === null || result === undefined) return undefined
-    if (this.isExpired(result)) {
-      this.logger.debug('Item {id} expired', { id })
+    if (result === null || result === undefined) {
+      this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
       return undefined
     }
-
+    if (this.isExpired(result)) {
+      this.logger.debug('Item {id} expired', { id })
+      this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
+      return undefined
+    }
+    this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
     return result
   }
 
@@ -491,10 +424,12 @@ export class Collection<T extends { id: string }> {
 
   /**
    * Query records with optional filtering and pagination.
-   * Streams through storage, applying filters without loading all into memory.
+   * Always performs a full scan (main file + all mutations).
    */
   async find(options: QueryOptions<T> = {}): Promise<T[]> {
+    const startTime = Date.now()
     const { where, limit, offset = 0, at } = options
+    const mutationCount = this.hooks?.onRead ? await this.countMutationFiles() : 0
     const latest = new Map<string, T | null>()
 
     // Build map of latest values
@@ -528,6 +463,7 @@ export class Collection<T extends { id: string }> {
       results = results.slice(offset, limit ? offset + limit : undefined)
     }
 
+    this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
     return results
   }
 

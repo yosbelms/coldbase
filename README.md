@@ -162,10 +162,10 @@ console.log('Server running at http://localhost:3000')
 - **Transactions**: Cross-collection consistency via saga pattern with best-effort compensation on failure (not ACID - see Limitations)
 - **Parallel Processing**: Configurable parallelism for mutation processing
 - **Retry Logic**: Exponential backoff with jitter for transient failures
-- **Hooks & Metrics**: Monitor writes, compactions, and errors
+- **Hooks & Metrics**: Monitor writes, reads, compactions, vacuums, and errors
 - **Size Limits**: Configurable mutation size limits
 - **Multiple Storage Backends**: S3, Azure Blob, GCS, or local filesystem
-- **Performance Optimizations**: Bloom filter, in-memory index, adaptive lease-based locking
+- **Performance Optimizations**: Bloom filter, adaptive lease-based locking
 
 ## Installation
 
@@ -503,7 +503,6 @@ interface DbOptions {
   vacuumCacheSize?: number     // LRU cache size for vacuum (default: 100000)
 
   // Performance optimizations
-  useIndex?: boolean           // Enable in-memory index for O(1) lookups (default: false)
   useBloomFilter?: boolean     // Enable bloom filter for fast "not exists" (default: false)
   bloomFilterExpectedItems?: number      // Expected items for sizing (default: 10000)
   bloomFilterFalsePositiveRate?: number  // False positive rate (default: 0.01)
@@ -533,6 +532,8 @@ interface DbHooks {
   onCompact?: (collection: string, durationMs: number, mutationCount: number) => void
   onVacuum?: (collection: string, durationMs: number, removedCount: number) => void
   onError?: (error: Error, operation: string) => void
+  // Called after each read (get, find, search) - use for monitoring read performance
+  onRead?: (collection: string, durationMs: number, mutationCount: number) => void
   // Called when auto-maintenance fails after all retries - use for alerting
   onMaintenanceFailure?: (collection: string, operation: 'compact' | 'vacuum', error: Error, attempts: number) => void
 }
@@ -913,7 +914,6 @@ try {
 ```
 users.jsonl              # Compacted user records (NDJSON)
 users.lock               # Distributed lock file (lease-based)
-users.idx                # Index file for fast lookups (optional)
 users.bloom              # Bloom filter for "not exists" checks (optional)
 users.mutation.ts-uuid1  # Pending mutations (timestamp prefixed)
 users.mutation.ts-uuid2
@@ -938,10 +938,9 @@ Vector collections use the same storage format as regular collections:
 ### Read Path
 
 1. **Bloom filter check** (if enabled): Return `undefined` immediately if ID definitely doesn't exist
-2. **Index lookup** (if enabled and no pending mutations): Direct byte-offset read for O(1) lookup
-3. **Full scan** (fallback): Stream main `.jsonl` file, then pending mutations
-4. Return latest value for requested ID(s)
-5. Filter expired records (if TTL defined)
+2. **Full scan**: Stream main `.jsonl` file, then pending mutations
+3. Return latest value for requested ID(s)
+4. Filter expired records (if TTL defined)
 
 ### Compaction Path
 
@@ -950,7 +949,7 @@ Vector collections use the same storage format as regular collections:
 3. List and read mutation files in parallel
 4. Append to main `.jsonl` file
 5. Delete processed mutations in chunks
-6. Rebuild index and bloom filter (if enabled)
+6. Rebuild bloom filter (if enabled)
 7. Release lock
 
 ### Vacuum Path (Single-Pass with LRU Cache)
@@ -962,7 +961,7 @@ Vector collections use the same storage format as regular collections:
 4. **Pass 2**: Write surviving records to temp file:
    - For tracked IDs: only keep the last occurrence (if not deleted)
    - For overflow IDs: keep all non-deleted records
-5. **Swap**: Replace main file, rebuild index and bloom filter
+5. **Swap**: Replace main file, rebuild bloom filter
 6. Release lock
 
 ## Performance Tips
@@ -971,26 +970,22 @@ Vector collections use the same storage format as regular collections:
    ```typescript
    const db = new Db(driver, { useBloomFilter: true })
    ```
-2. **Enable index** - O(1) lookups when no pending mutations
-   ```typescript
-   const db = new Db(driver, { useIndex: true })
-   ```
-3. **Use `batch()` for writes** - Coalesces multiple writes into single mutation file
+2. **Use `batch()` for writes** - Coalesces multiple writes into single mutation file
    ```typescript
    await collection.batch(tx => { tx.put({ id: '1', ... }); tx.put({ id: '2', ... }); })
    ```
-4. **Run compaction frequently** - More mutations = slower reads, stale index
-5. **Use `getMany()`** - Single scan for multiple IDs
-6. **Set appropriate TTLs** - Auto-expire old data
-7. **Tune `vacuumCacheSize`** - Larger cache = better deduplication during vacuum
-8. **Vector search with filters** - Apply metadata filters to reduce comparisons
+3. **Run compaction frequently** - More mutations = slower reads
+4. **Use `getMany()`** - Single scan for multiple IDs
+5. **Set appropriate TTLs** - Auto-expire old data
+6. **Tune `vacuumCacheSize`** - Larger cache = better deduplication during vacuum
+7. **Vector search with filters** - Apply metadata filters to reduce comparisons
    ```typescript
    await embeddings.search(query, { filter: { category: 'news' } })
    ```
 
 ## Limitations
 
-- **Read Performance**: Falls back to full scan when mutations are pending or index disabled
+- **Read Performance**: Always full scan (main file + mutations); bloom filter only eliminates reads for non-existent IDs
 - **Eventual Consistency**: Data is durable immediately but appears in main file after compaction
 - **Memory**: Vacuum uses LRU cache (default 100k IDs); overflow IDs aren't fully deduplicated
 - **Cross-Collection Transactions Are Not ACID**:

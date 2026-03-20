@@ -57,7 +57,6 @@ export class Db {
       autoCompact,
       autoVacuum,
       compactorConfig: this.compactorConfig,
-      useIndex: this.compactorConfig.useIndex,
       useBloomFilter: this.compactorConfig.useBloomFilter,
       bloomFilterExpectedItems: this.compactorConfig.bloomFilterExpectedItems,
       bloomFilterFalsePositiveRate: this.compactorConfig.bloomFilterFalsePositiveRate
@@ -76,13 +75,8 @@ export class Db {
     if (!col) {
       this.validateCollectionName(name)
       this.logger.debug('Creating collection instance {name}', { name })
-      col = new Collection<T>(
-        this._driver,
-        name,
-        this.collectionConfig,
-        this.hooks,
-        options
-      )
+      const config = options ? this.applyCollectionOptions(this.collectionConfig, options) : this.collectionConfig
+      col = new Collection<T>(this._driver, name, config, this.hooks, options)
       this.collections.set(name, col)
     }
     return col as Collection<T>
@@ -96,16 +90,26 @@ export class Db {
     if (!col) {
       this.validateCollectionName(name)
       this.logger.debug('Creating vector collection instance {name}', { name })
-      col = new VectorCollection<T>(
-        this._driver,
-        name,
-        this.collectionConfig,
-        options,
-        this.hooks
-      )
+      const config = this.applyCollectionOptions(this.collectionConfig, options)
+      col = new VectorCollection<T>(this._driver, name, config, options, this.hooks)
       this.vectorCollections.set(name, col)
     }
     return col as VectorCollection<T>
+  }
+
+  /**
+   * Merge per-collection bloom filter overrides on top of the Db-level config.
+   * Only fields explicitly set in options are overridden.
+   */
+  private applyCollectionOptions(
+    base: CollectionConfig,
+    options: Pick<CollectionOptions, 'useBloomFilter' | 'bloomFilterExpectedItems' | 'bloomFilterFalsePositiveRate'>
+  ): CollectionConfig {
+    const merged = { ...base }
+    if (options.useBloomFilter !== undefined) merged.useBloomFilter = options.useBloomFilter
+    if (options.bloomFilterExpectedItems !== undefined) merged.bloomFilterExpectedItems = options.bloomFilterExpectedItems
+    if (options.bloomFilterFalsePositiveRate !== undefined) merged.bloomFilterFalsePositiveRate = options.bloomFilterFalsePositiveRate
+    return merged
   }
 
   /**

@@ -17,18 +17,11 @@ import {
   SimilarityMetric
 } from './types'
 import {
-  cosineSimilarity,
   euclideanDistance,
   dotProduct,
   normalizeVector,
   validateVector
 } from './vector-utils'
-
-/** Index entry mapping ID to byte offset and length in main file */
-interface IndexEntry {
-  o: number // offset
-  l: number // length
-}
 
 /** Transaction interface for batching multiple writes */
 export interface VectorBatchTransaction<T extends VectorDocument> {
@@ -46,7 +39,6 @@ interface VectorCollectionConfig {
   autoCompact: boolean | AutoMaintenanceOptions
   autoVacuum: boolean | AutoVacuumOptions
   compactorConfig: CompactorConfig
-  useIndex: boolean
   useBloomFilter: boolean
   bloomFilterExpectedItems: number
   bloomFilterFalsePositiveRate: number
@@ -62,11 +54,8 @@ export class VectorCollection<T extends VectorDocument> {
   private compactor: CollectionCompactor
   private logger = getLogger(['coldbase', 'vector-collection'])
 
-  // Cached index and bloom filter (lazily loaded)
-  private cachedIndex?: Record<string, IndexEntry>
+  // Cached bloom filter (lazily loaded)
   private cachedBloomFilter?: BloomFilter
-  private cachedMainFileContent?: string
-  private indexValid = false
   private bloomFilterValid = false
 
   // Vector-specific options
@@ -78,7 +67,7 @@ export class VectorCollection<T extends VectorDocument> {
     private driver: StorageDriver,
     private name: string,
     private config: VectorCollectionConfig,
-    private vectorOptions: VectorCollectionOptions,
+    vectorOptions: VectorCollectionOptions,
     private hooks?: DbHooks
   ) {
     const bloomConfig = config.useBloomFilter
@@ -97,41 +86,11 @@ export class VectorCollection<T extends VectorDocument> {
   }
 
   /**
-   * Invalidate cached index, bloom filter, and file content.
-   * Called after writes since pending mutations make them stale.
+   * Invalidate cached bloom filter.
+   * Called after writes since pending mutations make it stale.
    */
   private invalidateCache(): void {
-    this.indexValid = false
     this.bloomFilterValid = false
-    this.cachedMainFileContent = undefined
-  }
-
-  /**
-   * Load the index from storage if enabled and valid.
-   * Index is only valid when there are no pending mutations.
-   */
-  private async loadIndex(): Promise<Record<string, IndexEntry> | undefined> {
-    if (!this.config.useIndex) return undefined
-    if (this.indexValid && this.cachedIndex) return this.cachedIndex
-
-    // Check if there are pending mutations - if so, index is stale
-    const mutations = await this.driver.list(`${this.name}.mutation.`)
-    if (mutations.keys.length > 0) {
-      this.indexValid = false
-      return undefined
-    }
-
-    try {
-      const resp = await this.driver.get(`${this.name}.idx`)
-      if (!resp) return undefined
-
-      const content = await streamToString(resp.stream)
-      this.cachedIndex = JSON.parse(content)
-      this.indexValid = true
-      return this.cachedIndex
-    } catch {
-      return undefined
-    }
   }
 
   /**
@@ -397,66 +356,43 @@ export class VectorCollection<T extends VectorDocument> {
 
   /**
    * Get a single record by ID.
+   *
+   * If bloom filter is enabled and says ID doesn't exist, returns immediately.
+   * Otherwise falls back to full scan (main file + all mutations).
    */
   async get(id: string, options: { at?: number } = {}): Promise<T | undefined> {
+    const startTime = Date.now()
+    const mutationCount = this.hooks?.onRead ? await this.countMutationFiles() : 0
+
     this.logger.debug('Getting item {id} from {name}', { id, name: this.name })
 
-    // Fast path: Check bloom filter first (only if not doing time travel)
     if (!options.at) {
       const bloom = await this.loadBloomFilter()
       if (bloom && !bloom.mightContain(id)) {
         this.logger.debug('Bloom filter: {id} definitely not in {name}', { id, name: this.name })
+        this.hooks?.onRead?.(this.name, Date.now() - startTime, 0)
         return undefined
       }
     }
 
-    // Fast path: Use index for direct lookup (only if not doing time travel)
-    if (!options.at) {
-      const index = await this.loadIndex()
-      if (index) {
-        const entry = index[id]
-        if (!entry) {
-          this.logger.debug('Index: {id} not found in {name}', { id, name: this.name })
-          return undefined
-        }
-
-        // Use cached file content or load it once
-        if (!this.cachedMainFileContent) {
-          const resp = await this.driver.get(`${this.name}.jsonl`)
-          if (resp) {
-            this.cachedMainFileContent = await streamToString(resp.stream)
-          }
-        }
-
-        if (this.cachedMainFileContent) {
-          const line = this.cachedMainFileContent.substring(entry.o, entry.o + entry.l)
-          try {
-            const [, data] = JSON.parse(line)
-            if (data !== null && !this.isExpired(data)) {
-              return data as T
-            }
-          } catch {
-            // Fall through to full scan
-          }
-        }
-      }
-    }
-
-    // Slow path: Full scan
+    // Full scan: main file + all mutations
     let result: T | null | undefined
-
     for await (const record of this.read({ at: options.at })) {
       if (record.id === id) {
         result = record.data
       }
     }
 
-    if (result === null || result === undefined) return undefined
-    if (this.isExpired(result)) {
-      this.logger.debug('Item {id} expired', { id })
+    if (result === null || result === undefined) {
+      this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
       return undefined
     }
-
+    if (this.isExpired(result)) {
+      this.logger.debug('Item {id} expired', { id })
+      this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
+      return undefined
+    }
+    this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
     return result
   }
 
@@ -488,6 +424,7 @@ export class VectorCollection<T extends VectorDocument> {
    * Returns results sorted by similarity (descending for cosine/dot, ascending for euclidean).
    */
   async search(queryVector: number[], options: SearchOptions<T> = {}): Promise<SearchResult<T>[]> {
+    const startTime = Date.now()
     const { limit = 10, threshold, filter, includeVector = false } = options
 
     // Validate query vector
@@ -502,6 +439,8 @@ export class VectorCollection<T extends VectorDocument> {
       ? (a: { id: string; score: number; data: T }, b: { id: string; score: number; data: T }) => b.score - a.score
       : (a: { id: string; score: number; data: T }, b: { id: string; score: number; data: T }) => a.score - b.score
     const heap = new TopKHeap<{ id: string; score: number; data: T }>(limit, compare)
+
+    const mutationCount = this.hooks?.onRead ? await this.countMutationFiles() : 0
 
     // Build map of latest values (handles updates/deletes)
     const latest = new Map<string, T | null>()
@@ -559,6 +498,7 @@ export class VectorCollection<T extends VectorDocument> {
     }
 
     const results = heap.toSortedArray()
+    this.hooks?.onRead?.(this.name, Date.now() - startTime, mutationCount)
 
     // Optionally strip vectors from results
     if (!includeVector) {

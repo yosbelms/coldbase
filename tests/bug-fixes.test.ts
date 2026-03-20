@@ -226,7 +226,6 @@ describe('Bug 3: LockAcquisitionError on storage failure, LockActiveError on con
   afterEach(() => cleanup(tmpDir))
 
   test('throws LockActiveError when another process holds the lock', async () => {
-    const compactor1 = new CollectionCompactor(driver)
     const compactor2 = new CollectionCompactor(driver)
 
     await driver.put('locked-col.mutation.1', JSON.stringify([['id1', { id: 'id1' }, 1000]]))

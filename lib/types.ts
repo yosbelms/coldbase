@@ -13,6 +13,12 @@ export type SimilarityMetric = 'cosine' | 'euclidean' | 'dotProduct'
 
 export interface CollectionOptions {
   ttlField?: string
+  /** Override Db-level setting for this collection only */
+  useBloomFilter?: boolean
+  /** Override Db-level setting for this collection only */
+  bloomFilterExpectedItems?: number
+  /** Override Db-level setting for this collection only */
+  bloomFilterFalsePositiveRate?: number
 }
 
 export interface VectorCollectionOptions {
@@ -20,6 +26,12 @@ export interface VectorCollectionOptions {
   metric?: SimilarityMetric  // default: 'cosine'
   normalize?: boolean        // default: true for cosine
   ttlField?: string
+  /** Override Db-level setting for this collection only */
+  useBloomFilter?: boolean
+  /** Override Db-level setting for this collection only */
+  bloomFilterExpectedItems?: number
+  /** Override Db-level setting for this collection only */
+  bloomFilterFalsePositiveRate?: number
 }
 
 export interface SearchOptions<T> {
@@ -54,6 +66,15 @@ export interface DbHooks {
   onCompact?: (collection: string, durationMs: number, mutationCount: number) => void
   onVacuum?: (collection: string, durationMs: number, removedCount: number) => void
   onError?: (error: Error, operation: string) => void
+  /**
+   * Called after each read operation (get, find, search).
+   * Use this to monitor read performance and detect when compaction is needed.
+   *
+   * @param collection - The collection that was read
+   * @param durationMs - How long the read took
+   * @param mutationCount - Number of pending mutation files scanned
+   */
+  onRead?: (collection: string, durationMs: number, mutationCount: number) => void
   /**
    * Called when auto-maintenance fails after all retry attempts.
    * Use this to alert on persistent maintenance failures that could lead to
@@ -180,12 +201,6 @@ export interface DbOptions extends CompactorConfig {
   }
 
   /**
-   * Enable in-memory index for fast lookups.
-   * Index is loaded from .idx file on first read and invalidated when mutations exist.
-   */
-  useIndex?: boolean
-
-  /**
    * Enable bloom filter for fast "not exists" checks.
    * Bloom filter is loaded from .bloom file and rebuilt during compaction.
    */
@@ -230,7 +245,6 @@ export const DEFAULT_CONFIG: Required<Omit<DbOptions, 'hooks' | 'retryOptions'>>
   maxMutationSize: 1024 * 1024 * 10, // 10MB
   leaseDurationMs: 30000, // 30 second base lease for serverless
   vacuumCacheSize: 100000, // Track up to 100k IDs in memory during vacuum
-  useIndex: false,
   useBloomFilter: false,
   bloomFilterExpectedItems: 10000,
   bloomFilterFalsePositiveRate: 0.01,

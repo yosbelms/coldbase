@@ -115,9 +115,9 @@ describe('Load Tests', () => {
       console.log(`Random get() without index (${lookups} lookups): ${duration.toFixed(2)}ms (${(lookups / duration * 1000).toFixed(0)} ops/sec)`)
     })
 
-    test('get() with index enabled - random lookups', async () => {
-      const indexedDb = new Db(driver, { useIndex: true })
-      const collection = indexedDb.collection<TestRecord>('read-with-index')
+    test('get() with bloom filter - random lookups', async () => {
+      const bloomDb = new Db(driver, { useBloomFilter: true })
+      const collection = bloomDb.collection<TestRecord>('read-with-bloom-random')
 
       // Pre-populate
       await collection.batch(tx => {
@@ -135,7 +135,7 @@ describe('Load Tests', () => {
       }
       const duration = performance.now() - start
 
-      console.log(`Random get() with index (${lookups} lookups): ${duration.toFixed(2)}ms (${(lookups / duration * 1000).toFixed(0)} ops/sec)`)
+      console.log(`Random get() with bloom filter (${lookups} lookups): ${duration.toFixed(2)}ms (${(lookups / duration * 1000).toFixed(0)} ops/sec)`)
     })
 
     test('get() with bloom filter - non-existent keys', async () => {
@@ -261,8 +261,8 @@ describe('Load Tests', () => {
       expect(await collection.countMutationFiles()).toBe(0)
     })
 
-    test('compact with index and bloom filter rebuild', async () => {
-      const optimizedDb = new Db(driver, { useIndex: true, useBloomFilter: true })
+    test('compact with bloom filter rebuild', async () => {
+      const optimizedDb = new Db(driver, { useBloomFilter: true })
       const collection = optimizedDb.collection<TestRecord>('compact-optimized')
 
       // Create records
@@ -276,10 +276,9 @@ describe('Load Tests', () => {
       await collection.compact()
       const duration = performance.now() - start
 
-      console.log(`Compact with index+bloom rebuild (500 records): ${duration.toFixed(2)}ms`)
+      console.log(`Compact with bloom filter rebuild (500 records): ${duration.toFixed(2)}ms`)
 
-      // Verify index and bloom filter exist
-      expect(fs.existsSync(path.join(testDir, 'compact-optimized.idx'))).toBe(true)
+      // Verify bloom filter exists
       expect(fs.existsSync(path.join(testDir, 'compact-optimized.bloom'))).toBe(true)
     })
   })
